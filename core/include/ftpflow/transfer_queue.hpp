@@ -25,6 +25,7 @@
 
 #include "ftpflow/compress_decide.hpp"
 #include "ftpflow/ftp_session.hpp"
+#include "ftpflow/ftz1.hpp"
 #include "ftpflow/sftp_session.hpp"
 #include "ftpflow/ssh_exec.hpp"
 #include "ftpflow/ssh_transfer.hpp"
@@ -59,6 +60,19 @@ struct TransferRequest {
     // Remote decompressor template for compress mode; {file} -> "remote".
     // Empty -> sshDefaultPushCommandTemplate() (system zstd).
     std::string pushCommandTemplate;
+
+    // Resume: pick up from the already-transferred prefix (FTP REST/APPE,
+    // SFTP seek, SSH append-push). Uploads stat the remote file, downloads
+    // stat the local file. With an appending remote agent this yields
+    // byte-exact continuation; the queue verifies the final size.
+    bool resume = false;
+
+    // Ship as an FTZ1 container (SFTP endpoints only, both directions).
+    // Upload: local -> container -> remotePath + ".ftz1".
+    // Download: remotePath is the container, localPath the extraction
+    // target. Frames are hash-verified on extract; corrupt frames are
+    // named in the error.
+    bool ftzArchive = false;
 };
 
 struct TransferEvent {

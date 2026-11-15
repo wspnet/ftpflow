@@ -10,12 +10,15 @@
 #include "ftpflow/transfer_queue.hpp"
 
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <sys/stat.h>
+#include <thread>
 #include <vector>
 
 static int g_checks = 0;
@@ -77,6 +80,48 @@ static void record(Recorded* r, const ftpflow::TransferEvent& e) {
             break;
         default: break;
     }
+}
+
+// ---- small file helpers (resume / FTZ1 legs) -----------------------------
+
+static std::string exeDir() {
+    char buf[MAX_PATH];
+    GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    std::string p(buf);
+    const std::size_t slash = p.find_last_of("\\/");
+    return p.substr(0, slash);
+}
+
+static std::string readAll(const std::string& path) {
+    std::string out;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return out;
+    char buf[64 * 1024];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+static bool filesEqual(const std::string& a, const std::string& b) {
+    return readAll(a) == readAll(b);
+}
+
+// Writes `totalBytes` of compressible filler with a distinct prefix.
+static void makeFiller(const std::string& path, std::size_t totalBytes) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    const char* blk = "ftpflow transfer-queue filler block ";
+    const std::size_t blkLen = 34;
+    std::size_t written = 0;
+    while (written + blkLen <= totalBytes) {
+        std::fwrite(blk, 1, blkLen, f);
+        written += blkLen;
+    }
+    if (written < totalBytes) {
+        std::fwrite(blk, 1, totalBytes - written, f);
+    }
+    std::fclose(f);
 }
 
 int main() {
@@ -185,9 +230,199 @@ int main() {
             CHECK(r.canceled.load() == 0);
             CHECK(r.failed.load() == 0);
         }
+
+        {   // FTP resume via the queue: upload a 1 MiB prefix, then --resume
+            // the full 8 MiB (REST/APPE continuation), byte-identical.
+            const std::string tmp = "C:/Users/wspne/AppData/Local/Temp";
+            const std::string full = tmp + "/tq_r_full.bin";
+            const std::string prefix = tmp + "/tq_r_prefix.bin";
+            const std::string back = tmp + "/tq_r_back.bin";
+            makeFiller(full, 8 * 1024 * 1024);
+            makeFiller(prefix, 1024 * 1024);
+            {
+                ftpflow::TransferQueue q(1, 50);
+                Recorded r;
+                q.setEventCallback([&r](const ftpflow::TransferEvent& e) { record(&r, e); });
+                ftpflow::TransferRequest pre;
+                pre.protocol = ftpflow::BackendKind::Ftp;
+                pre.ftp.host = "127.0.0.1";
+                pre.ftp.port = 2121;
+                pre.ftp.user = "tester";
+                pre.ftp.password = "secret";
+                pre.localPath = prefix;
+                pre.remotePath = "/tq_r.bin";
+                q.enqueue(pre);
+
+                ftpflow::TransferRequest res = pre;
+                res.localPath = full;
+                res.resume = true;
+                q.enqueue(res);
+                q.waitAll();
+                CHECK(r.finished.load() == 2);
+                CHECK(r.failed.load() == 0);
+                CHECK(r.canceled.load() == 0);
+            }
+            ftpflow::FtpSession ftp;
+            ftpflow::FtpOptions fopt;
+            fopt.host = "127.0.0.1";
+            fopt.port = 2121;
+            fopt.user = "tester";
+            fopt.password = "secret";
+            CHECK(ftp.open(fopt).ok());
+            std::uint64_t moved = 0;
+            CHECK(ftp.download("/tq_r.bin", back, 0, &moved).ok());
+            CHECK(moved == 8 * 1024 * 1024);
+            CHECK(filesEqual(full, back));
+            std::remove(full.c_str());
+            std::remove(prefix.c_str());
+            std::remove(back.c_str());
+        }
         std::remove(big.c_str());
     } else {
         std::printf("[info] no live pyftpdlib on 127.0.0.1:2121 -> skipping Part B\n");
+    }
+
+    // ---- Part C: SSH compress resume + FTZ1 (local sshd + test key) ------
+    {
+        const char* keyPath = "C:/Users/wspne/.ssh/ftpflow_test_rsa";
+        std::FILE* kf = std::fopen(keyPath, "rb");
+        const std::string pem = kf ? readAll(keyPath) : std::string();
+        if (kf) std::fclose(kf);
+        if (pem.empty() || !tcpProbe("127.0.0.1", 22, 300)) {
+            std::printf("[info] no local sshd + key -> skipping Part C\n");
+        } else {
+            const std::string tmp = "C:/Users/wspne/AppData/Local/Temp";
+            const std::string full = tmp + "/tq_c_full.bin";
+            const std::string prefix = tmp + "/tq_c_prefix.bin";
+            const std::string back = tmp + "/tq_c_back.bin";
+            const std::string extract = tmp + "/tq_c_extract.bin";
+            const std::string remote = tmp + "/tq_c_remote.bin";
+            const std::string remoteFtz = tmp + "/tq_c_remote.ftz1";
+            const std::string remoteBase = tmp + "/tq_c_remote";
+            makeFiller(full, 4 * 1024 * 1024);
+            makeFiller(prefix, 1024 * 1024);
+            std::remove(remote.c_str());
+            std::remove(remoteFtz.c_str());
+
+            ftpflow::SshEndpoint ep;
+            ep.host = "127.0.0.1";
+            ep.user = "wspne";
+            ep.password = "-";
+            ep.privateKeyPem = pem;
+
+            // The remote decompressor agent (same machine in the test
+            // setup): ftpcli zdecode with a truncating / appending shell
+            // redirect, exactly like a remote zstd deployment.
+            const std::string agent = exeDir() + "\\..\\cli\\ftpcli.exe zdecode";
+
+            {   // compressed resume: push the prefix, then --resume append
+                ftpflow::TransferQueue q(1, 50);
+                Recorded r;
+                q.setEventCallback([&r](const ftpflow::TransferEvent& e) { record(&r, e); });
+
+                ftpflow::TransferRequest pre;
+                pre.protocol = ftpflow::BackendKind::Sftp;
+                pre.ssh = ep;
+                pre.localPath = prefix;
+                pre.remotePath = remote;
+                pre.pushCommandTemplate = agent + " > {file}";
+                q.enqueue(pre);
+
+                ftpflow::TransferRequest res = pre;
+                res.localPath = full;
+                res.resume = true;
+                res.pushCommandTemplate = agent + " >> {file}";
+                q.enqueue(res);
+                q.waitAll();
+                CHECK(r.finished.load() == 2);
+                CHECK(r.failed.load() == 0);
+                CHECK(r.canceled.load() == 0);
+            }
+
+            {   // verify through SFTP: exact size + byte-identical content
+                ftpflow::SftpSession sftp(ftpflow::HostKeyPolicy::AcceptNew);
+                std::string ak;
+                CHECK(sftp.open(ep, {}, &ak).ok());
+                std::uint64_t remoteSize = 0;
+                CHECK(sftp.size(remote, &remoteSize).ok());
+                CHECK(remoteSize == 4 * 1024 * 1024);
+                std::uint64_t moved = 0;
+                CHECK(sftp.download(remote, back, 0, &moved).ok());
+                CHECK(filesEqual(full, back));
+
+                {   // idempotent resume: remote already complete -> Done
+                    // without shipping a single byte on the wire.
+                    ftpflow::TransferQueue q(1, 50);
+                    Recorded r;
+                    std::atomic<std::uint64_t> lastWire{1};
+                    q.setEventCallback([&](const ftpflow::TransferEvent& e) {
+                        record(&r, e);
+                        if (e.kind == ftpflow::TransferEvent::Kind::Finished)
+                            lastWire = e.progress.bytesOnWire;
+                    });
+                    ftpflow::TransferRequest res;
+                    res.protocol = ftpflow::BackendKind::Sftp;
+                    res.ssh = ep;
+                    res.localPath = full;
+                    res.remotePath = remote;
+                    res.resume = true;
+                    res.pushCommandTemplate = agent + " >> {file}";
+                    q.enqueue(res);
+                    q.waitAll();
+                    CHECK(r.finished.load() == 1);
+                    CHECK(r.failed.load() == 0);
+                    CHECK(lastWire.load() == 0);
+                }
+            }
+
+            {   // FTZ1 archive roundtrip: upload as container, download +
+                // extract, frame hash verification, byte-identical.
+                ftpflow::TransferQueue q(1, 50);
+                Recorded rUp;
+                q.setEventCallback([&rUp](const ftpflow::TransferEvent& e) { record(&rUp, e); });
+                ftpflow::TransferRequest up;
+                up.protocol = ftpflow::BackendKind::Sftp;
+                up.ssh = ep;
+                up.localPath = full;
+                up.remotePath = remoteBase;   // -> remoteBase + ".ftz1"
+                up.ftzArchive = true;
+                q.enqueue(up);
+                q.waitAll();
+                CHECK(rUp.finished.load() == 1);
+                CHECK(rUp.failed.load() == 0);
+
+                ftpflow::SftpSession sftp(ftpflow::HostKeyPolicy::AcceptNew);
+                std::string ak;
+                CHECK(sftp.open(ep, {}, &ak).ok());
+                std::uint64_t containerSize = 0;
+                CHECK(sftp.size(remoteFtz, &containerSize).ok());
+                CHECK(containerSize > 0);
+                CHECK(containerSize < 4 * 1024 * 1024);   // compressible filler
+
+                ftpflow::TransferQueue q2(1, 50);
+                Recorded rDown;
+                q2.setEventCallback([&rDown](const ftpflow::TransferEvent& e) { record(&rDown, e); });
+                ftpflow::TransferRequest down;
+                down.protocol = ftpflow::BackendKind::Sftp;
+                down.ssh = ep;
+                down.direction = ftpflow::TransferDirection::Download;
+                down.localPath = extract;
+                down.remotePath = remoteFtz;   // names the container
+                down.ftzArchive = true;
+                q2.enqueue(down);
+                q2.waitAll();
+                CHECK(rDown.finished.load() == 1);
+                CHECK(rDown.failed.load() == 0);
+                CHECK(filesEqual(full, extract));
+            }
+
+            std::remove(full.c_str());
+            std::remove(prefix.c_str());
+            std::remove(back.c_str());
+            std::remove(extract.c_str());
+            std::remove(remote.c_str());
+            std::remove(remoteFtz.c_str());
+        }
     }
 
     std::printf("%d checks, %d failed\n", g_checks, g_failed);

@@ -64,10 +64,16 @@ FileProbe probeLocalFile(const std::string& path) {
 }
 
 // {file} -> "<remote>" (same quoting as the ssh push CLI path).
-std::string buildPushCommand(const TransferRequest& req) {
-    const std::string tmpl = req.pushCommandTemplate.empty()
-        ? sshDefaultPushCommandTemplate()
-        : req.pushCommandTemplate;
+// append=true swaps the default template for its >> variant (resume mode);
+// caller-supplied templates are used verbatim.
+std::string buildPushCommand(const TransferRequest& req, bool append) {
+    std::string tmpl;
+    if (req.pushCommandTemplate.empty()) {
+        tmpl = append ? sshDefaultPushAppendTemplate()
+                      : sshDefaultPushCommandTemplate();
+    } else {
+        tmpl = req.pushCommandTemplate;
+    }
     std::string cmd = tmpl;
     const std::string quoted = "\"" + req.remotePath + "\"";
     for (std::size_t pos; (pos = cmd.find("{file}")) != std::string::npos;) {
@@ -235,8 +241,10 @@ void TransferQueue::runJob(Job* job) {
     // --- pick the pipeline --------------------------------------------------
     TransferMode mode = TransferMode::Store;
     Decision decision;
-    if (req.protocol == BackendKind::Sftp &&
-        req.direction == TransferDirection::Upload) {
+    if (req.ftzArchive) {
+        mode = TransferMode::Ftz1;
+    } else if (req.protocol == BackendKind::Sftp &&
+               req.direction == TransferDirection::Upload) {
         if (req.autoDecide) {
             const FileProbe probe = probeLocalFile(req.localPath);
             decision = decideFullFunnel(probe, req.costModel);
@@ -273,29 +281,144 @@ void TransferQueue::runJob(Job* job) {
 
     std::string error;
     TransferState finalState = TransferState::Done;
+    // Already-transferred prefix picked up by resume mode. Backends count
+    // progress differently (curl includes the prefix, SFTP does not), so
+    // mapProgress normalizes to "moved counts the prefix exactly once".
+    std::uint64_t resumePrefix = 0;
+    auto mapProgress = [&](std::uint64_t moved, std::uint64_t total) {
+        if (moved >= resumePrefix) {
+            tp.bytesMoved = moved;
+            tp.bytesTotal = total;
+        } else {
+            tp.bytesMoved = resumePrefix + moved;
+            tp.bytesTotal = resumePrefix + total;
+        }
+        tp.bytesOnWire = tp.bytesMoved;
+        tp.compressionRatio = 1.0;
+        emitProgress();
+    };
 
-    if (req.protocol == BackendKind::Ftp) {
+    if (mode == TransferMode::Ftz1 && req.protocol == BackendKind::Ftp) {
+        error = "ftz archive requires an sftp/ssh endpoint";
+        finalState = TransferState::Failed;
+    } else if (mode == TransferMode::Ftz1) {
+        // ---- FTZ1 container pipeline (SFTP endpoints, both ways) --------
+        SftpSession sftp(HostKeyPolicy::AcceptNew);
+        std::string acceptedKey;
+        SftpResult r = sftp.open(req.ssh, {}, &acceptedKey);
+        if (!r.ok()) {
+            error = std::string("sftp open: ") + r.message;
+            finalState = TransferState::Failed;
+        } else if (req.direction == TransferDirection::Upload) {
+            // local -> container -> remotePath + ".ftz1"
+            const std::string container = req.localPath + ".ftz1.part";
+            FtzInfo info;
+            const FtzStatus fs = ftzWrite(req.localPath, container, 8,
+                                          req.zstdLevel, &info);
+            if (fs != FtzStatus::Ok) {
+                error = std::string("ftzWrite: ") + ftzStatusName(fs);
+                finalState = TransferState::Failed;
+            } else {
+                const std::uint64_t containerSize = localFileSize(container);
+                tp.compressionRatio = info.originalSize > 0
+                    ? (double)containerSize / (double)info.originalSize
+                    : 1.0;
+                sftp.setProgressCallback(
+                    [&](std::uint64_t moved, std::uint64_t total) {
+                        tp.bytesMoved = moved;
+                        tp.bytesTotal = total;
+                        tp.bytesOnWire = moved;
+                        emitProgress();
+                    });
+                std::uint64_t moved = 0;
+                SftpResult tr = sftp.upload(container, req.remotePath + ".ftz1",
+                                            0, &moved, &job->ctl);
+                std::remove(container.c_str());
+                if (tr.status == SftpStatus::Canceled) {
+                    finalState = TransferState::Canceled;
+                } else if (!tr.ok()) {
+                    error = tr.message;
+                    finalState = TransferState::Failed;
+                } else {
+                    tp.bytesMoved = tp.bytesTotal = containerSize;
+                    tp.bytesOnWire = containerSize;
+                }
+            }
+        } else {
+            // remotePath is the container; localPath the extraction target.
+            const std::string container = req.localPath + ".ftz1.part";
+            sftp.setProgressCallback(
+                [&](std::uint64_t moved, std::uint64_t total) {
+                    tp.bytesMoved = moved;
+                    tp.bytesTotal = total;
+                    tp.bytesOnWire = moved;
+                    emitProgress();
+                });
+            std::uint64_t moved = 0;
+            SftpResult tr = sftp.download(req.remotePath, container, 0, &moved,
+                                          &job->ctl);
+            if (tr.status == SftpStatus::Canceled) {
+                finalState = TransferState::Canceled;
+                std::remove(container.c_str());
+            } else if (!tr.ok()) {
+                error = tr.message;
+                finalState = TransferState::Failed;
+                std::remove(container.c_str());
+            } else {
+                // Frame-level hash verification; corrupt frames are named.
+                std::vector<std::uint32_t> bad;
+                const FtzStatus fs = ftzExtract(container, req.localPath, &bad);
+                std::remove(container.c_str());
+                if (fs != FtzStatus::Ok) {
+                    error = std::string("ftzExtract: ") + ftzStatusName(fs);
+                    if (!bad.empty()) {
+                        error += " (bad frames";
+                        for (std::uint32_t f : bad)
+                            error += " " + std::to_string(f);
+                        error += ")";
+                    }
+                    finalState = TransferState::Failed;
+                } else {
+                    tp.bytesMoved = tp.bytesTotal = moved;
+                    tp.bytesOnWire = moved;
+                }
+            }
+        }
+    } else if (req.protocol == BackendKind::Ftp) {
         FtpSession ftp;
         FtpResult r = ftp.open(req.ftp);
         if (!r.ok()) {
             error = std::string("ftp open: ") + r.message;
             finalState = TransferState::Failed;
         } else {
-            ftp.setProgressCallback([&](std::uint64_t moved, std::uint64_t total) {
-                tp.bytesMoved = moved;
-                tp.bytesTotal = total;
-                tp.bytesOnWire = moved;   // raw pipeline
-                tp.compressionRatio = 1.0;
-                emitProgress();
-            });
+            if (req.resume) {
+                if (req.direction == TransferDirection::Upload) {
+                    std::uint64_t remoteSize = 0;
+                    if (ftp.size(req.remotePath, &remoteSize).ok())
+                        resumePrefix = remoteSize;
+                } else {
+                    resumePrefix = localFileSize(req.localPath);
+                }
+            }
+            ftp.setProgressCallback(
+                [&](std::uint64_t moved, std::uint64_t total) {
+                    mapProgress(moved, total);
+                });
+            std::uint64_t moved = 0;
             FtpResult tr = req.direction == TransferDirection::Upload
-                ? ftp.upload(req.localPath, req.remotePath, 0, &tp.bytesMoved, &job->ctl)
-                : ftp.download(req.remotePath, req.localPath, 0, &tp.bytesMoved, &job->ctl);
+                ? ftp.upload(req.localPath, req.remotePath, resumePrefix,
+                             &moved, &job->ctl)
+                : ftp.download(req.remotePath, req.localPath, resumePrefix,
+                               &moved, &job->ctl);
             if (tr.status == FtpStatus::Canceled) {
                 finalState = TransferState::Canceled;
             } else if (!tr.ok()) {
                 error = tr.message;
                 finalState = TransferState::Failed;
+            } else {
+                tp.bytesMoved = resumePrefix + moved;
+                tp.bytesTotal = std::max(tp.bytesTotal, tp.bytesMoved);
+                tp.bytesOnWire = tp.bytesMoved;
             }
         }
     } else if (mode == TransferMode::Store) {
@@ -309,29 +432,80 @@ void TransferQueue::runJob(Job* job) {
             error = std::string("sftp open: ") + r.message;
             finalState = TransferState::Failed;
         } else {
-            sftp.setProgressCallback([&](std::uint64_t moved, std::uint64_t total) {
-                tp.bytesMoved = moved;
-                tp.bytesTotal = total;
-                tp.bytesOnWire = moved;
-                tp.compressionRatio = 1.0;
-                emitProgress();
-            });
+            if (req.resume) {
+                if (req.direction == TransferDirection::Upload) {
+                    std::uint64_t remoteSize = 0;
+                    if (sftp.size(req.remotePath, &remoteSize).ok())
+                        resumePrefix = remoteSize;
+                } else {
+                    resumePrefix = localFileSize(req.localPath);
+                }
+            }
+            sftp.setProgressCallback(
+                [&](std::uint64_t moved, std::uint64_t total) {
+                    mapProgress(moved, total);
+                });
+            std::uint64_t moved = 0;
             SftpResult tr = req.direction == TransferDirection::Upload
-                ? sftp.upload(req.localPath, req.remotePath, 0, &tp.bytesMoved, &job->ctl)
-                : sftp.download(req.remotePath, req.localPath, 0, &tp.bytesMoved, &job->ctl);
+                ? sftp.upload(req.localPath, req.remotePath, resumePrefix,
+                              &moved, &job->ctl)
+                : sftp.download(req.remotePath, req.localPath, resumePrefix,
+                                &moved, &job->ctl);
             if (tr.status == SftpStatus::Canceled) {
                 finalState = TransferState::Canceled;
             } else if (!tr.ok()) {
                 error = tr.message;
                 finalState = TransferState::Failed;
+            } else {
+                tp.bytesMoved = resumePrefix + moved;
+                tp.bytesTotal = std::max(tp.bytesTotal, tp.bytesMoved);
+                tp.bytesOnWire = tp.bytesMoved;
             }
         }
     } else {
-        // Compress: one exec channel per job, streaming zstd.
+        // Compress: one exec channel per job, streaming zstd. Resume stats
+        // the remote partial through SFTP and appends from that offset.
         const std::uint64_t localSize = localFileSize(req.localPath);
+        std::uint64_t resumeFrom = 0;
+        bool alreadyComplete = false;
+
+        if (req.direction == TransferDirection::Upload) {
+            if (req.resume) {
+                SftpSession stat(HostKeyPolicy::AcceptNew);
+                std::string ak;
+                if (stat.open(req.ssh, {}, &ak).ok()) {
+                    std::uint64_t remoteSize = 0;
+                    if (stat.size(req.remotePath, &remoteSize).ok()) {
+                        if (remoteSize == localSize) {
+                            alreadyComplete = true;
+                        } else if (remoteSize < localSize) {
+                            resumeFrom = remoteSize;
+                        } else {
+                            // Remote longer than local (stale file): restart
+                            // from scratch so the -o template can truncate.
+                            stat.removeFile(req.remotePath);
+                        }
+                    }
+                }
+            }
+            if (alreadyComplete) {
+                tp.bytesMoved = tp.bytesTotal = localSize;
+                TransferEvent fe;
+                fe.jobId = job->id;
+                fe.kind = TransferEvent::Kind::Finished;
+                fe.state = TransferState::Done;
+                fe.mode = mode;
+                fe.progress = tp;
+                job->state = TransferState::Done;
+                emitEvent(fe);
+                return;
+            }
+        }
+
         SshExec ssh(HostKeyPolicy::AcceptNew);
         std::string acceptedKey;
-        SshResult r = ssh.open(req.ssh, buildPushCommand(req), {}, &acceptedKey);
+        SshResult r = ssh.open(req.ssh, buildPushCommand(req, resumeFrom > 0),
+                               {}, &acceptedKey);
         if (!r.ok()) {
             error = std::string("ssh open: ") + r.message;
             finalState = TransferState::Failed;
@@ -339,9 +513,11 @@ void TransferQueue::runJob(Job* job) {
             SshPushOptions opts;
             opts.zstdLevel = req.zstdLevel;
             opts.control = &job->ctl;
+            opts.resumeFrom = resumeFrom;
+            resumePrefix = resumeFrom;
             SshPushStats st;
             opts.onProgress = [&](const SshPushStats& s) {
-                tp.bytesMoved = s.localBytes;
+                tp.bytesMoved = resumePrefix + s.localBytes;
                 tp.bytesOnWire = s.compressedBytes;
                 tp.bytesTotal = localSize;
                 tp.compressionRatio = s.localBytes > 0
@@ -356,10 +532,28 @@ void TransferQueue::runJob(Job* job) {
                 error = pr.message;
                 finalState = TransferState::Failed;
             } else {
-                tp.bytesMoved = st.localBytes;
+                tp.bytesMoved = resumePrefix + st.localBytes;
                 tp.bytesTotal = localSize;
                 tp.bytesOnWire = st.compressedBytes;
-                tp.compressionRatio = st.ratio();
+                tp.compressionRatio = st.localBytes > 0
+                    ? (double)st.compressedBytes / (double)st.localBytes
+                    : 1.0;
+                // 0-byte-drift check: the remote file must now be exactly
+                // localSize bytes (upload direction only).
+                if (req.direction == TransferDirection::Upload) {
+                    SftpSession verify(HostKeyPolicy::AcceptNew);
+                    std::string vk;
+                    if (verify.open(req.ssh, {}, &vk).ok()) {
+                        std::uint64_t remoteSize = 0;
+                        if (verify.size(req.remotePath, &remoteSize).ok() &&
+                            remoteSize != localSize) {
+                            error = "size mismatch after push: remote " +
+                                    std::to_string(remoteSize) + " vs local " +
+                                    std::to_string(localSize);
+                            finalState = TransferState::Failed;
+                        }
+                    }
+                }
             }
         }
     }

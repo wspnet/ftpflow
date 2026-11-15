@@ -592,16 +592,22 @@ int cmdSftp(const std::vector<std::string>& a) {
 }
 
 // queue <ftp|sftp|ssh> <host[:port]> <user> <pw|-> [--key K] [--workers N]
-//       [--level N] [--cmd T] [--store] <local> <remote> [<local> <remote>...]
+//       [--level N] [--cmd T] [--store] [--resume] [--ftz]
+//       <local> <remote> [<local> <remote>...]
 //   Enqueues transfers through the concurrent TransferQueue and prints the
 //   event stream. 'ssh' uploads auto-decide Compress vs Store through the
-//   5-stage funnel (--store forces SFTP store).
+//   5-stage funnel (--store forces SFTP store). --resume picks up partial
+//   transfers (FTP REST/APPE, SFTP seek, SSH append; byte-exact). --ftz
+//   ships SSH/SFTP transfers as FTZ1 containers (remotePath + ".ftz1" on
+//   upload; remotePath names the container on download), frame-verified.
 int cmdQueue(const std::vector<std::string>& a) {
     if (a.size() < 6) {
         std::fprintf(stderr,
             "usage: ftpcli queue <ftp|sftp|ssh> <host[:port]> <user> <pw|-> [--key K]\n"
             "                     [--workers N] [--level N] [--cmd T] [--store]\n"
-            "                     <local> <remote> [<local> <remote> ...]\n");
+            "                     [--resume] [--ftz] <local> <remote> [...]\n"
+            "  --resume: continue from the already-transferred prefix.\n"
+            "  --ftz:    FTZ1 container mode (ssh/sftp endpoints only).\n");
         return 2;
     }
     const std::string& proto = a[0];
@@ -624,6 +630,9 @@ int cmdQueue(const std::vector<std::string>& a) {
     int level = 3;
     std::string cmdTemplate;
     bool store = false;
+    bool doResume = false;
+    bool ftz = false;
+    bool down = false;
     std::vector<std::string> pos;
     for (std::size_t i = 4; i < a.size(); ++i) {
         if (a[i] == "--key" && i + 1 < a.size()) {
@@ -640,6 +649,12 @@ int cmdQueue(const std::vector<std::string>& a) {
             cmdTemplate = a[++i];
         } else if (a[i] == "--store") {
             store = true;
+        } else if (a[i] == "--resume") {
+            doResume = true;
+        } else if (a[i] == "--ftz") {
+            ftz = true;
+        } else if (a[i] == "--down") {
+            down = true;
         } else {
             pos.push_back(a[i]);
         }
@@ -658,12 +673,14 @@ int cmdQueue(const std::vector<std::string>& a) {
                         : e.state == ftpflow::TransferState::Failed  ? "failed  "
                         : e.state == ftpflow::TransferState::Canceled ? "canceled"
                                                                      : "running ";
+        const char* mode = e.mode == ftpflow::TransferMode::Compress ? "compress"
+                          : e.mode == ftpflow::TransferMode::Ftz1     ? "ftz1    "
+                                                                      : "store   ";
         const double pct = e.progress.bytesTotal > 0
             ? 100.0 * (double)e.progress.bytesMoved / (double)e.progress.bytesTotal
             : 0.0;
         std::printf("[job %llu] %s %s mode=%s %.1f%% (%llu/%llu, wire %llu, ratio %.3f)%s%s\n",
-            (unsigned long long)e.jobId, kind, st,
-            e.mode == ftpflow::TransferMode::Compress ? "compress" : "store",
+            (unsigned long long)e.jobId, kind, st, mode,
             pct,
             (unsigned long long)e.progress.bytesMoved,
             (unsigned long long)e.progress.bytesTotal,
@@ -684,7 +701,8 @@ int cmdQueue(const std::vector<std::string>& a) {
         const std::string& local = pos[i];
         const std::string& remote = pos[i + 1];
         ftpflow::TransferRequest req;
-        req.direction = ftpflow::TransferDirection::Upload;
+        req.direction = down ? ftpflow::TransferDirection::Download
+                             : ftpflow::TransferDirection::Upload;
         req.protocol = proto == "ftp" ? ftpflow::BackendKind::Ftp
                                        : ftpflow::BackendKind::Sftp;
         req.localPath = local;
@@ -693,6 +711,8 @@ int cmdQueue(const std::vector<std::string>& a) {
         req.ssh = ep;
         req.zstdLevel = level;
         req.pushCommandTemplate = cmdTemplate;
+        req.resume = doResume;
+        req.ftzArchive = ftz;
         if (store) {
             req.autoDecide = false;
             req.mode = ftpflow::TransferMode::Store;
@@ -721,7 +741,10 @@ int main(int argc, char** argv) {
             "  ftpcli ssh exec <host[:port]> <user> <password> <cmd...>\n"
             "  ftpcli ssh push <host> <user> <pw|-> [--key K] [--level N]\n"
             "                   [--cmd T] <local> <remote>   zstd exec-channel push\n"
-            "  ftpcli zdecode                         stdin zstd -> stdout (agent)\n",
+            "  ftpcli zdecode                         stdin zstd -> stdout (agent)\n"
+            "  ftpcli queue <ftp|sftp|ssh> ...        concurrent transfer queue\n"
+            "         [--resume] continue partial transfers (byte-exact)\n"
+            "         [--ftz]    ship as FTZ1 containers (frame-verified)\n",
             ftpflow::versionString());
         return args.empty() ? 2 : 0;
     }

@@ -31,6 +31,13 @@ SshResult sshPushFile(SshExec& ssh, const std::string& localPath,
 
     std::FILE* f = std::fopen(localPath.c_str(), "rb");
     if (!f) return {SshStatus::IoError, "cannot open local " + localPath};
+    if (opts.resumeFrom > 0) {
+        if (_fseeki64(f, (long long)opts.resumeFrom, SEEK_SET) != 0) {
+            std::fclose(f);
+            return {SshStatus::IoError,
+                    "cannot seek local file to resume offset"};
+        }
+    }
 
     ZSTD_CStream* cs = ZSTD_createCStream();
     if (!cs) {
@@ -44,6 +51,7 @@ SshResult sshPushFile(SshExec& ssh, const std::string& localPath,
     }
 
     SshPushStats st;
+    st.resumeFrom = opts.resumeFrom;
     std::string remoteErr;   // last ~2 KiB of remote stderr
     ssh.setStderrSink([&remoteErr](const void* p, std::size_t n) {
         remoteErr.append(static_cast<const char*>(p), n);

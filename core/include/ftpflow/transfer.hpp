@@ -15,6 +15,7 @@ enum class TransferDirection : std::uint8_t { Upload, Download };
 enum class TransferMode : std::uint8_t {
     Store,      // raw byte pipeline (FTP always; SSH fallback)
     Compress,   // SSH exec single-stream zstd pipeline (the fast path)
+    Ftz1,       // ship an FTZ1 container (.ftz1): frame-verifiable resume
 };
 
 // Live progress for one transfer task. Pushed at throttle intervals

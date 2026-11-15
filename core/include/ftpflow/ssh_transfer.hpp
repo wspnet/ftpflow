@@ -24,7 +24,9 @@
 namespace ftpflow {
 
 struct SshPushStats {
-    std::uint64_t localBytes = 0;       // bytes read from disk
+    std::uint64_t localBytes = 0;       // bytes read from disk THIS run
+    std::uint64_t resumeFrom = 0;       // prefix already at the remote
+                                        // before this run (resume mode)
     std::uint64_t compressedBytes = 0;  // bytes pushed into the channel
     double ratio() const {
         return localBytes == 0
@@ -40,6 +42,12 @@ inline std::string sshDefaultPushCommandTemplate() {
     return "zstd -d -c - -o {file}";
 }
 
+// Append variant for resumed pushes: the remote file already holds a
+// byte-exact prefix of the local file, so the agent must NOT truncate.
+inline std::string sshDefaultPushAppendTemplate() {
+    return "zstd -d -c - >> {file}";
+}
+
 // Streams localPath through zstd (level from opts) into the open channel's
 // stdin, then sendEof + pump until the remote command exits. Requires
 // FTPFLOW_HAVE_ZSTD; otherwise EngineUnavailable. The remote exit status
@@ -49,6 +57,11 @@ struct SshPushOptions {
     int zstdLevel = 3;
     int chunkKiB = 256;           // local read + compressed flush size
     int remoteTimeoutMs = 60000;  // overall wait for the remote to exit
+    // Resume support: skip the first `resumeFrom` bytes of the local file
+    // and compress the remainder as a FRESH zstd stream. The remote agent
+    // must APPEND (see sshDefaultPushAppendTemplate) -- the caller is
+    // responsible for opening the channel with such a command.
+    std::uint64_t resumeFrom = 0;
     // Polled between chunks (from another thread, e.g. the queue).
     const TransferControl* control = nullptr;
     // Called after each chunk with cumulative stats. Throttle downstream:
