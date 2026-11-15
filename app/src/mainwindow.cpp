@@ -59,6 +59,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     siteStore_.load();
 
     queue_ = std::make_unique<TransferQueue>(2, 100);
+    workersSpin_->setValue(static_cast<int>(queue_->workerCount()));
     queue_->setEventCallback([this](const TransferEvent& ev) {
         // Worker thread -> UI thread.
         QMetaObject::invokeMethod(
@@ -310,7 +311,7 @@ void MainWindow::buildUi() {
     dockBarLay->addWidget(new QLabel("并发:", dockBar));
     workersSpin_ = new QSpinBox(dockBar);
     workersSpin_->setRange(1, 64);
-    workersSpin_->setValue(static_cast<int>(queue_->workerCount()));
+    workersSpin_->setValue(2);   // matches TransferQueue(2, ...) below
     workersSpin_->setToolTip(
         "同时传输的 worker 数（1-64）。调小会让多余 worker 跑完当前文件后退出。");
     dockBarLay->addWidget(workersSpin_);
