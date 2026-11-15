@@ -108,6 +108,14 @@ public:
     // chunk. Throttle downstream.
     void setProgressCallback(std::function<void(std::uint64_t, std::uint64_t)> fn);
 
+    // Metadata operations (MKD / DELE / RMD / RNFR+RNTO through libcurl).
+    // Same error contract as the transfer calls; lastError() holds the
+    // server response tail when one fails.
+    FtpResult mkdir(const std::string& remotePath);
+    FtpResult removeFile(const std::string& remotePath);
+    FtpResult removeDir(const std::string& remotePath);
+    FtpResult rename(const std::string& from, const std::string& to);
+
     bool isOpen() const { return opened_; }
     void close();
 
@@ -118,6 +126,7 @@ public:
 
 private:
     struct Impl;
+    FtpResult quoteCommand(const std::string& cmd);
     Impl* impl_ = nullptr;
     bool opened_ = false;
     FtpOptions opt_;

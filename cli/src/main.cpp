@@ -592,7 +592,7 @@ int cmdSftp(const std::vector<std::string>& a) {
 }
 
 // queue <ftp|sftp|ssh> <host[:port]> <user> <pw|-> [--key K] [--workers N]
-//       [--level N] [--cmd T] [--store] [--resume] [--ftz]
+//       [--level N] [--cmd T] [--store] [--resume] [--ftz] [--down] [-r]
 //       <local> <remote> [<local> <remote>...]
 //   Enqueues transfers through the concurrent TransferQueue and prints the
 //   event stream. 'ssh' uploads auto-decide Compress vs Store through the
@@ -600,14 +600,17 @@ int cmdSftp(const std::vector<std::string>& a) {
 //   transfers (FTP REST/APPE, SFTP seek, SSH append; byte-exact). --ftz
 //   ships SSH/SFTP transfers as FTZ1 containers (remotePath + ".ftz1" on
 //   upload; remotePath names the container on download), frame-verified.
+//   -r treats each pair as directory ROOTS and enqueues the whole tree.
 int cmdQueue(const std::vector<std::string>& a) {
     if (a.size() < 6) {
         std::fprintf(stderr,
             "usage: ftpcli queue <ftp|sftp|ssh> <host[:port]> <user> <pw|-> [--key K]\n"
             "                     [--workers N] [--level N] [--cmd T] [--store]\n"
-            "                     [--resume] [--ftz] <local> <remote> [...]\n"
+            "                     [--resume] [--ftz] [--down] [-r]\n"
+            "                     <local> <remote> [...]\n"
             "  --resume: continue from the already-transferred prefix.\n"
-            "  --ftz:    FTZ1 container mode (ssh/sftp endpoints only).\n");
+            "  --ftz:    FTZ1 container mode (ssh/sftp endpoints only).\n"
+            "  --down:   download direction. -r: recursive (dir roots).\n");
         return 2;
     }
     const std::string& proto = a[0];
@@ -633,6 +636,7 @@ int cmdQueue(const std::vector<std::string>& a) {
     bool doResume = false;
     bool ftz = false;
     bool down = false;
+    bool recursive = false;
     std::vector<std::string> pos;
     for (std::size_t i = 4; i < a.size(); ++i) {
         if (a[i] == "--key" && i + 1 < a.size()) {
@@ -655,6 +659,8 @@ int cmdQueue(const std::vector<std::string>& a) {
             ftz = true;
         } else if (a[i] == "--down") {
             down = true;
+        } else if (a[i] == "-r" || a[i] == "--recursive") {
+            recursive = true;
         } else {
             pos.push_back(a[i]);
         }
@@ -717,9 +723,27 @@ int cmdQueue(const std::vector<std::string>& a) {
             req.autoDecide = false;
             req.mode = ftpflow::TransferMode::Store;
         }
-        const std::uint64_t id = queue.enqueue(std::move(req));
-        std::printf("[queue] enqueued job %llu: %s -> %s\n",
-            (unsigned long long)id, local.c_str(), remote.c_str());
+        if (recursive) {
+            std::string terr;
+            const std::vector<std::uint64_t> ids =
+                queue.enqueueTree(std::move(req), &terr);
+            if (!terr.empty()) {
+                std::fprintf(stderr, "queue: recursive walk failed: %s\n",
+                    terr.c_str());
+                return 1;
+            }
+            if (ids.empty()) {
+                std::printf("[queue] nothing to transfer under %s\n",
+                    local.c_str());
+            } else {
+                std::printf("[queue] enqueued %llu jobs: %s -> %s (recursive)\n",
+                    (unsigned long long)ids.size(), local.c_str(), remote.c_str());
+            }
+        } else {
+            const std::uint64_t id = queue.enqueue(std::move(req));
+            std::printf("[queue] enqueued job %llu: %s -> %s\n",
+                (unsigned long long)id, local.c_str(), remote.c_str());
+        }
     }
     queue.waitAll();
     std::printf("[queue] drained\n");

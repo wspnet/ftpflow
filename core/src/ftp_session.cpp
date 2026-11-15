@@ -448,6 +448,96 @@ void FtpSession::setProgressCallback(
     if (impl_) impl_->xfer.onProgress = std::move(fn);
 }
 
+// ---- metadata ops (MKD / DELE / RMD / RNFR+RNTO) -------------------------
+//
+// libcurl has no first-class verbs for these, so we drive them through
+// CURLOPT_QUOTE (commands issued verbatim after login/CWD, before the
+// transfer). Empirically (pyftpdlib wire log): a NOBODY transfer on the
+// root URL + one QUOTE command runs exactly our verb and nothing else;
+// CURLOPT_CUSTOMREQUEST is NOT usable here -- curl CWDs into the URL
+// path first and aborts before the custom request when the path does
+// not exist yet (which is precisely the MKD case).
+
+#if defined(FTPFLOW_HAVE_CURL)
+FtpResult FtpSession::quoteCommand(const std::string& cmd) {
+    if (!impl_ || !impl_->easy) return {FtpStatus::IoError, "not open"};
+    impl_->lastErr.clear();
+    struct curl_slist* quote = nullptr;
+    quote = ::curl_slist_append(quote, cmd.c_str());
+    ::curl_easy_setopt(impl_->easy, CURLOPT_URL,
+                       makeUrl(opt_, "/", true).c_str());
+    ::curl_easy_setopt(impl_->easy, CURLOPT_QUOTE, quote);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 1L);
+    CURLcode rc = ::curl_easy_perform(impl_->easy);
+    ::curl_slist_free_all(quote);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_QUOTE, nullptr);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 0L);
+    if (rc != CURLE_OK) {
+        impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
+        impl_->lastErr = *impl_->errBuf ? impl_->errBuf
+                                        : ::curl_easy_strerror(rc);
+        impl_->lastErr = cmd.substr(0, cmd.find(' ')) + ": " + impl_->lastErr;
+        return {FtpStatus::IoError, impl_->lastErr, rc};
+    }
+    return {};
+}
+#endif
+
+FtpResult FtpSession::mkdir(const std::string& remotePath) {
+#if defined(FTPFLOW_HAVE_CURL)
+    return quoteCommand("MKD " + remotePath);
+#else
+    return {FtpStatus::EngineUnavailable, "built without libcurl"};
+#endif
+}
+
+FtpResult FtpSession::removeFile(const std::string& remotePath) {
+#if defined(FTPFLOW_HAVE_CURL)
+    return quoteCommand("DELE " + remotePath);
+#else
+    return {FtpStatus::EngineUnavailable, "built without libcurl"};
+#endif
+}
+
+FtpResult FtpSession::removeDir(const std::string& remotePath) {
+#if defined(FTPFLOW_HAVE_CURL)
+    return quoteCommand("RMD " + remotePath);
+#else
+    return {FtpStatus::EngineUnavailable, "built without libcurl"};
+#endif
+}
+
+FtpResult FtpSession::rename(const std::string& from, const std::string& to) {
+#if defined(FTPFLOW_HAVE_CURL)
+    if (!impl_ || !impl_->easy) return {FtpStatus::IoError, "not open"};
+    impl_->lastErr.clear();
+    // RNFR + RNTO must run as one sequence, so both commands share one
+    // QUOTE list (curl issues them in order and aborts on the first
+    // failure).
+    struct curl_slist* quote = nullptr;
+    quote = ::curl_slist_append(quote, ("RNFR " + from).c_str());
+    quote = ::curl_slist_append(quote, ("RNTO " + to).c_str());
+    ::curl_easy_setopt(impl_->easy, CURLOPT_URL,
+                       makeUrl(opt_, "/", true).c_str());
+    ::curl_easy_setopt(impl_->easy, CURLOPT_QUOTE, quote);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 1L);
+    CURLcode rc = ::curl_easy_perform(impl_->easy);
+    ::curl_slist_free_all(quote);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_QUOTE, nullptr);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 0L);
+    if (rc != CURLE_OK) {
+        impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
+        impl_->lastErr = *impl_->errBuf ? impl_->errBuf
+                                        : ::curl_easy_strerror(rc);
+        impl_->lastErr = "rename: " + impl_->lastErr;
+        return {FtpStatus::IoError, impl_->lastErr, rc};
+    }
+    return {};
+#else
+    return {FtpStatus::EngineUnavailable, "built without libcurl"};
+#endif
+}
+
 std::string FtpSession::lastError() const {
     return impl_ ? impl_->lastErr : std::string();
 }

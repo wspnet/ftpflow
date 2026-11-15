@@ -1,13 +1,69 @@
 // ftpflow -- concurrent transfer queue implementation.
 #include "ftpflow/transfer_queue.hpp"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <sys/stat.h>
+
+#include "ftpflow/tree_walk.hpp"
 
 namespace ftpflow {
 
 namespace {
+
+// UTF-8 -> wide (Win32 boundary; same policy as vfs_local).
+std::wstring toWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(),
+                                      nullptr, 0);
+    std::wstring w((std::size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+// mkdir -p for the local parent chain of a '/'-separated path. Creates
+// every missing prefix; "already exists" is not an error. NOTE: the
+// loop includes the FINAL slash (index == last) -- that prefix is the
+// file's direct parent directory.
+void ensureLocalParentDir(const std::string& localPath) {
+    const std::size_t last = localPath.find_last_of('/');
+    for (std::size_t i = 1; i <= last; ++i) {
+        if (localPath[i] != '/') continue;
+        const std::string seg = localPath.substr(0, i);
+        if (seg.size() < 2 || seg.back() == ':') continue;
+        CreateDirectoryW(toWide(seg).c_str(), nullptr);
+    }
+}
+
+// mkdir -p over the remote parent chain (FTP flavor). Attempts MKD on
+// every prefix and ignores failures: existing dirs, drive roots, and
+// permission errors all collapse to "still fine to try the transfer".
+void ensureRemoteDirFtp(FtpSession& ftp, const std::string& remotePath) {
+    std::size_t pos = 0;
+    while ((pos = remotePath.find('/', pos + 1)) != std::string::npos) {
+        const std::string prefix = remotePath.substr(0, pos);
+        if (prefix.size() < 2 || prefix.back() == ':' || prefix == "/")
+            continue;
+        ftp.mkdir(prefix);
+    }
+}
+
+// mkdir -p over the remote parent chain (SFTP flavor, same contract).
+void ensureRemoteDirSftp(SftpSession& sftp, const std::string& remotePath) {
+    std::size_t pos = 0;
+    while ((pos = remotePath.find('/', pos + 1)) != std::string::npos) {
+        const std::string prefix = remotePath.substr(0, pos);
+        if (prefix.size() < 2 || prefix.back() == ':' || prefix == "/")
+            continue;
+        sftp.mkdir(prefix, 0755);
+    }
+}
 
 // Throttled progress emitter: computes speed from wall-clock deltas and
 // drops events that arrive faster than the configured interval. The final
@@ -118,6 +174,55 @@ std::uint64_t TransferQueue::enqueue(TransferRequest req) {
     }
     cvPop_.notify_one();
     return id;
+}
+
+std::vector<std::uint64_t> TransferQueue::enqueueTree(TransferRequest rootTemplate,
+                                                      std::string* error) {
+    std::vector<std::uint64_t> ids;
+    std::vector<TreeEntry> entries;
+    std::string walkErr;
+
+    if (rootTemplate.direction == TransferDirection::Upload) {
+        if (!walkLocalTree(rootTemplate.localPath, entries, &walkErr)) {
+            if (error) *error = "walk " + rootTemplate.localPath + ": " + walkErr;
+            return ids;
+        }
+    } else if (rootTemplate.protocol == BackendKind::Ftp) {
+        FtpSession ftp;
+        const FtpResult r = ftp.open(rootTemplate.ftp);
+        if (!r.ok()) {
+            if (error) *error = "ftp open: " + r.message;
+            return ids;
+        }
+        if (!walkRemoteTree(ftp, rootTemplate.remotePath, entries, &walkErr)) {
+            if (error) *error = "walk " + rootTemplate.remotePath + ": " + walkErr;
+            return ids;
+        }
+    } else {
+        SftpSession sftp(HostKeyPolicy::AcceptNew);
+        std::string acceptedKey;
+        const SftpResult r = sftp.open(rootTemplate.ssh, {}, &acceptedKey);
+        if (!r.ok()) {
+            if (error) *error = "sftp open: " + r.message;
+            return ids;
+        }
+        if (!walkRemoteTree(sftp, rootTemplate.remotePath, entries, &walkErr)) {
+            if (error) *error = "walk " + rootTemplate.remotePath + ": " + walkErr;
+            return ids;
+        }
+    }
+
+    for (const TreeEntry& e : entries) {
+        if (e.isDir) continue;   // created on the fly by the file jobs
+        TransferRequest req = rootTemplate;
+        req.localPath = joinTreePath(rootTemplate.localPath, e.relPath);
+        req.remotePath = joinTreePath(rootTemplate.remotePath, e.relPath);
+        if (rootTemplate.direction == TransferDirection::Upload)
+            req.ensureRemoteDir = true;
+        const std::uint64_t id = enqueue(std::move(req));
+        if (id != 0) ids.push_back(id);
+    }
+    return ids;
 }
 
 bool TransferQueue::cancel(std::uint64_t jobId) {
@@ -265,6 +370,11 @@ void TransferQueue::runJob(Job* job) {
     TransferProgress tp;
     tp.compressionRatio = 1.0;
 
+    // Downloads always materialize the local parent chain (recursive
+    // downloads land in trees that may not exist yet).
+    if (req.direction == TransferDirection::Download)
+        ensureLocalParentDir(req.localPath);
+
     auto emitProgress = [&](bool force = false) {
         if (!gate.pass(force)) return;
         tp.speedBytesPerSec = tp.bytesMoved > 0
@@ -391,6 +501,10 @@ void TransferQueue::runJob(Job* job) {
             error = std::string("ftp open: ") + r.message;
             finalState = TransferState::Failed;
         } else {
+            if (req.direction == TransferDirection::Upload &&
+                req.ensureRemoteDir) {
+                ensureRemoteDirFtp(ftp, req.remotePath);
+            }
             if (req.resume) {
                 if (req.direction == TransferDirection::Upload) {
                     std::uint64_t remoteSize = 0;
@@ -432,6 +546,10 @@ void TransferQueue::runJob(Job* job) {
             error = std::string("sftp open: ") + r.message;
             finalState = TransferState::Failed;
         } else {
+            if (req.direction == TransferDirection::Upload &&
+                req.ensureRemoteDir) {
+                ensureRemoteDirSftp(sftp, req.remotePath);
+            }
             if (req.resume) {
                 if (req.direction == TransferDirection::Upload) {
                     std::uint64_t remoteSize = 0;
@@ -469,13 +587,19 @@ void TransferQueue::runJob(Job* job) {
         std::uint64_t resumeFrom = 0;
         bool alreadyComplete = false;
 
-        if (req.direction == TransferDirection::Upload) {
-            if (req.resume) {
-                SftpSession stat(HostKeyPolicy::AcceptNew);
-                std::string ak;
-                if (stat.open(req.ssh, {}, &ak).ok()) {
+        // One SFTP helper session covers mkdir -p (recursive uploads),
+        // the resume stat, and the post-push size verification.
+        std::unique_ptr<SftpSession> sftpHelper;
+        if (req.direction == TransferDirection::Upload &&
+            (req.ensureRemoteDir || req.resume)) {
+            sftpHelper = std::make_unique<SftpSession>(HostKeyPolicy::AcceptNew);
+            std::string hk;
+            if (sftpHelper->open(req.ssh, {}, &hk).ok()) {
+                if (req.ensureRemoteDir)
+                    ensureRemoteDirSftp(*sftpHelper, req.remotePath);
+                if (req.resume) {
                     std::uint64_t remoteSize = 0;
-                    if (stat.size(req.remotePath, &remoteSize).ok()) {
+                    if (sftpHelper->size(req.remotePath, &remoteSize).ok()) {
                         if (remoteSize == localSize) {
                             alreadyComplete = true;
                         } else if (remoteSize < localSize) {
@@ -483,23 +607,24 @@ void TransferQueue::runJob(Job* job) {
                         } else {
                             // Remote longer than local (stale file): restart
                             // from scratch so the -o template can truncate.
-                            stat.removeFile(req.remotePath);
+                            sftpHelper->removeFile(req.remotePath);
                         }
                     }
                 }
             }
-            if (alreadyComplete) {
-                tp.bytesMoved = tp.bytesTotal = localSize;
-                TransferEvent fe;
-                fe.jobId = job->id;
-                fe.kind = TransferEvent::Kind::Finished;
-                fe.state = TransferState::Done;
-                fe.mode = mode;
-                fe.progress = tp;
-                job->state = TransferState::Done;
-                emitEvent(fe);
-                return;
-            }
+        }
+        if (alreadyComplete) {
+            // Nothing to ship: the remote already holds the exact file.
+            tp.bytesMoved = tp.bytesTotal = localSize;
+            TransferEvent fe;
+            fe.jobId = job->id;
+            fe.kind = TransferEvent::Kind::Finished;
+            fe.state = TransferState::Done;
+            fe.mode = mode;
+            fe.progress = tp;
+            job->state = TransferState::Done;
+            emitEvent(fe);
+            return;
         }
 
         SshExec ssh(HostKeyPolicy::AcceptNew);
@@ -541,17 +666,23 @@ void TransferQueue::runJob(Job* job) {
                 // 0-byte-drift check: the remote file must now be exactly
                 // localSize bytes (upload direction only).
                 if (req.direction == TransferDirection::Upload) {
-                    SftpSession verify(HostKeyPolicy::AcceptNew);
-                    std::string vk;
-                    if (verify.open(req.ssh, {}, &vk).ok()) {
-                        std::uint64_t remoteSize = 0;
-                        if (verify.size(req.remotePath, &remoteSize).ok() &&
-                            remoteSize != localSize) {
-                            error = "size mismatch after push: remote " +
-                                    std::to_string(remoteSize) + " vs local " +
-                                    std::to_string(localSize);
-                            finalState = TransferState::Failed;
-                        }
+                    std::unique_ptr<SftpSession> verify;
+                    if (sftpHelper && sftpHelper->isOpen()) {
+                        verify = std::move(sftpHelper);
+                    } else {
+                        verify = std::make_unique<SftpSession>(
+                            HostKeyPolicy::AcceptNew);
+                        std::string vk;
+                        verify->open(req.ssh, {}, &vk);
+                    }
+                    std::uint64_t remoteSize = 0;
+                    if (verify->isOpen() &&
+                        verify->size(req.remotePath, &remoteSize).ok() &&
+                        remoteSize != localSize) {
+                        error = "size mismatch after push: remote " +
+                                std::to_string(remoteSize) + " vs local " +
+                                std::to_string(localSize);
+                        finalState = TransferState::Failed;
                     }
                 }
             }

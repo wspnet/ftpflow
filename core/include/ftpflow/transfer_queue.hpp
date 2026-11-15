@@ -73,6 +73,12 @@ struct TransferRequest {
     // target. Frames are hash-verified on extract; corrupt frames are
     // named in the error.
     bool ftzArchive = false;
+
+    // Recursive-upload helper: make sure the remote parent directory of
+    // remotePath exists before transferring (mkdir -p, failures to create
+    // an already-existing dir are ignored). Downloads always create the
+    // local parent directory chain.
+    bool ensureRemoteDir = false;
 };
 
 struct TransferEvent {
@@ -99,6 +105,15 @@ public:
     void setEventCallback(EventCallback cb);
 
     std::uint64_t enqueue(TransferRequest req);   // -> jobId (1-based)
+
+    // Recursive directory transfer. The template's localPath/remotePath
+    // name the ROOTS: uploads walk the local tree, downloads walk the
+    // remote tree (SFTP readdir / FTP LIST). One job per file; uploads
+    // set ensureRemoteDir so remote parents are created on the fly.
+    // Returns the job ids; empty + *error when the walk fails. Events
+    // fire exactly like plain enqueue() jobs.
+    std::vector<std::uint64_t> enqueueTree(TransferRequest rootTemplate,
+                                           std::string* error = nullptr);
 
     // Queued job: dropped before it starts. Running job: flips the
     // control flag; the backend aborts at its next chunk boundary.
