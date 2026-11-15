@@ -168,6 +168,48 @@ int main() {
         check(spins <= 20, "cat terminates after stdin EOF (no hang)");
     }
 
+    {   // interactive shell: PTY + shell, write a command, read its echo.
+        ftpflow::SshExec ssh(ftpflow::HostKeyPolicy::AcceptNew);
+        std::string out;
+        ssh.setStdoutSink([&](const void* p, std::size_t n) {
+            out.append(static_cast<const char*>(p), n);
+        });
+        std::string ak;
+        check(ssh.openShell(ep, {}, 80, 24, &ak).ok(), "open PTY shell");
+
+        // Drain the initial prompt (may include a banner).
+        int spins = 0;
+        while (ssh.pump(200)) {
+            if (++spins > 50) break;
+        }
+        check(ssh.isOpen(), "shell stays open after prompt drain");
+
+        // Run a command that echoes an unmistakable marker.
+        check(ssh.write("echo __PTY_MARKER__\n", 20).ok(), "write command");
+        std::string markerOut;
+        spins = 0;
+        while (markerOut.find("__PTY_MARKER__") == std::string::npos) {
+            if (spins++ > 50) break;
+            ssh.pump(200);
+            // append the newest chunk into markerOut via a fresh sink is not
+            // possible here; instead we poll the accumulated `out`.
+            if (out.find("__PTY_MARKER__") != std::string::npos) {
+                markerOut = out;
+                break;
+            }
+        }
+        check(out.find("__PTY_MARKER__") != std::string::npos,
+              "shell echoes command output");
+
+        // Resize must succeed on the open PTY.
+        check(ssh.resize(120, 40).ok(), "resize PTY");
+
+        // Close the shell cleanly (exit).
+        ssh.write("exit\n", 5);
+        spins = 0;
+        while (ssh.pump(200) && spins++ < 50) {}
+    }
+
     std::printf("ssh_exec: %d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

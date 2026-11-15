@@ -97,6 +97,23 @@ public:
                    const std::vector<std::string>& trustedHostKeyHex,
                    std::string* acceptedHostKeyHex = nullptr);
 
+    // Interactive shell: allocate a PTY (xterm-256color) and start the
+    // remote login shell on it. This is the interactive-terminal path; it
+    // differs from open() in three ways:
+    //   * a PTY is requested with the given size (cols x rows),
+    //   * the channel runs a shell rather than a single command,
+    //   * stdin stays open for bidirectional input -- do NOT sendEof().
+    // With a PTY, stdout and stderr are multiplexed onto one stream, so the
+    // output arrives via the stdout sink only (setStderrSink is a no-op).
+    SshResult openShell(const SshEndpoint& ep,
+                        const std::vector<std::string>& trustedHostKeyHex,
+                        int cols, int rows,
+                        std::string* acceptedHostKeyHex = nullptr);
+
+    // Resize the remote PTY (window-size change). Only valid on a shell
+    // channel opened with openShell().
+    SshResult resize(int cols, int rows);
+
     // Feed one chunk into the remote command's stdin. Returns Closed once
     // the channel is gone. Never blocks longer than `timeoutMs`.
     SshResult write(const void* data, std::size_t len, int timeoutMs = 5000);
@@ -127,6 +144,15 @@ public:
 private:
     struct Impl;
     enum class State : std::uint8_t { Idle, Open, Closed };
+
+    // Shared front half of open()/openShell(): resolve, connect, handshake,
+    // verify the host key, authenticate, and open a session channel. On
+    // success impl_->channel is valid and state_ stays Idle (the caller then
+    // starts the channel as exec or pty+shell).
+    SshResult connectSession(const SshEndpoint& ep,
+                             const std::vector<std::string>& trustedHostKeyHex,
+                             std::string* acceptedHostKeyHex);
+
     Impl* impl_ = nullptr;
     State state_ = State::Idle;
     HostKeyPolicy policy_ = HostKeyPolicy::Strict;

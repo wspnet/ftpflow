@@ -87,10 +87,13 @@ SshExec::SshExec(HostKeyPolicy policy) : policy_(policy) {
 
 SshExec::~SshExec() { close(); delete impl_; }
 
-SshResult SshExec::open(const SshEndpoint& ep,
-                        const std::string& command,
-                        const std::vector<std::string>& trustedHostKeyHex,
-                        std::string* acceptedHostKeyHex) {
+// Shared front half: resolve -> connect -> handshake -> host-key verify ->
+// auth -> open session channel. On success impl_->channel is valid and the
+// caller must still start the channel (exec or pty+shell).
+SshResult SshExec::connectSession(
+        const SshEndpoint& ep,
+        const std::vector<std::string>& trustedHostKeyHex,
+        std::string* acceptedHostKeyHex) {
     if (impl_ == nullptr) impl_ = new Impl();
     close();
 
@@ -155,8 +158,6 @@ SshResult SshExec::open(const SshEndpoint& ep,
 
     // Authentication: private key when provided, else password.
     if (!ep.privateKeyPem.empty()) {
-        // publickeyfiledata = nullptr: libssh2 extracts the public key
-        // from the private key blob itself.
         while ((rc = libssh2_userauth_publickey_frommemory(
                     impl_->session, ep.user.c_str(), ep.user.size(),
                     nullptr, 0,
@@ -188,19 +189,83 @@ SshResult SshExec::open(const SshEndpoint& ep,
         close();
         return r;
     }
+    return {};
+}
 
+SshResult SshExec::open(const SshEndpoint& ep,
+                        const std::string& command,
+                        const std::vector<std::string>& trustedHostKeyHex,
+                        std::string* acceptedHostKeyHex) {
+    SshResult r = connectSession(ep, trustedHostKeyHex, acceptedHostKeyHex);
+    if (!r.ok()) return r;
+
+    int rc = 0;
     while ((rc = libssh2_channel_exec(impl_->channel, command.c_str()))
            == LIBSSH2_ERROR_EAGAIN) {
         waitSocket(impl_->sock, true, 5000);
     }
     if (rc != 0) {
-        SshResult r = mapSshErr(SshStatus::ChannelFailed, "exec", impl_->session);
+        SshResult e = mapSshErr(SshStatus::ChannelFailed, "exec", impl_->session);
         close();
-        return r;
+        return e;
     }
 
     state_ = State::Open;
     exitCode_ = -1;
+    return {};
+}
+
+SshResult SshExec::openShell(const SshEndpoint& ep,
+                             const std::vector<std::string>& trustedHostKeyHex,
+                             int cols, int rows,
+                             std::string* acceptedHostKeyHex) {
+    SshResult r = connectSession(ep, trustedHostKeyHex, acceptedHostKeyHex);
+    if (!r.ok()) return r;
+
+    // Request a PTY of the given size. "xterm-256color" advertises 256-color
+    // and mouse support; most servers honor it.
+    int rc = 0;
+    while ((rc = libssh2_channel_request_pty_ex(
+                impl_->channel, "xterm-256color", sizeof("xterm-256color") - 1,
+                nullptr, 0, cols, rows, 0, 0))
+           == LIBSSH2_ERROR_EAGAIN) {
+        waitSocket(impl_->sock, true, 5000);
+    }
+    if (rc != 0) {
+        SshResult e = mapSshErr(SshStatus::ChannelFailed, "request pty", impl_->session);
+        close();
+        return e;
+    }
+
+    // Start the login shell on the PTY.
+    while ((rc = libssh2_channel_shell(impl_->channel))
+           == LIBSSH2_ERROR_EAGAIN) {
+        waitSocket(impl_->sock, true, 5000);
+    }
+    if (rc != 0) {
+        SshResult e = mapSshErr(SshStatus::ChannelFailed, "shell", impl_->session);
+        close();
+        return e;
+    }
+
+    state_ = State::Open;
+    exitCode_ = -1;
+    return {};
+}
+
+SshResult SshExec::resize(int cols, int rows) {
+    if (state_ != State::Open || !impl_ || !impl_->channel) {
+        return {SshStatus::Closed, "channel not open"};
+    }
+    int rc = 0;
+    while ((rc = libssh2_channel_request_pty_size_ex(
+                impl_->channel, cols, rows, 0, 0))
+           == LIBSSH2_ERROR_EAGAIN) {
+        waitSocket(impl_->sock, true, 5000);
+    }
+    if (rc != 0) {
+        return mapSshErr(SshStatus::ChannelFailed, "resize pty", impl_->session);
+    }
     return {};
 }
 
@@ -333,6 +398,19 @@ SshResult SshExec::open(const SshEndpoint&, const std::string&,
                         const std::vector<std::string>&, std::string*) {
     return {SshStatus::EngineUnavailable,
             "built without libssh2 (build with FTPFLOW_WITH_LIBSSH2 / --full preset)"};
+}
+SshResult SshExec::connectSession(const SshEndpoint&,
+                                  const std::vector<std::string>&,
+                                  std::string*) {
+    return {SshStatus::EngineUnavailable, "built without libssh2"};
+}
+SshResult SshExec::openShell(const SshEndpoint&,
+                             const std::vector<std::string>&, int, int,
+                             std::string*) {
+    return {SshStatus::EngineUnavailable, "built without libssh2"};
+}
+SshResult SshExec::resize(int, int) {
+    return {SshStatus::EngineUnavailable, "built without libssh2"};
 }
 SshResult SshExec::write(const void*, std::size_t, int) {
     return {SshStatus::EngineUnavailable, "built without libssh2"};
