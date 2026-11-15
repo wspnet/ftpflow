@@ -39,7 +39,8 @@
       "displayName": "Release with protocol backends (needs vcpkg)",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-ftpflow",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/triplets",
         "FTPFLOW_WITH_CURL": "ON",
         "FTPFLOW_WITH_LIBSSH2": "ON",
         "FTPFLOW_WITH_ZSTD": "ON"

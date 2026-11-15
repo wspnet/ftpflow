@@ -93,6 +93,15 @@ def build_env(msvc: Path, sdk_ver, sdk_inc, sdk_lib, sdk_bin, ninja_dir):
     env["LIB"] = ";".join(lib)
     env["PATH"] = ";".join(path) + ";" + env.get("PATH", "")
     env.setdefault("Platform", "x64")
+    # Variables vcvars64.bat would normally export. CMake (and vcpkg's
+    # child CMake runs) use them to locate rc.exe / mt.exe; without them
+    # compiler ABI test programs fail to link (CMAKE_MT-NOTFOUND).
+    sdk_dir = str(Path(KITS10)) + "\\"
+    env["WindowsSDKDir"] = sdk_dir
+    env["UniversalCRTSdkDir"] = sdk_dir
+    env["WindowsSDKVersion"] = sdk_ver.name + "\\"
+    env["VCINSTALLDir"] = str(msvc.parents[2]) + "\\"
+    env["VCToolsInstallDir"] = str(msvc) + "\\"
     return env
 
 
@@ -134,7 +143,8 @@ def main() -> int:
             die(f"--full needs vcpkg at {vcpkg_root} "
                 "(git clone + bootstrap-vcpkg.bat), or set VCPKG_ROOT.")
         env["VCPKG_ROOT"] = str(vcpkg_root)
-        env["VCPKG_DEFAULT_TRIPLET"] = "x64-windows-static"
+        env["VCPKG_DEFAULT_TRIPLET"] = "x64-windows-static-ftpflow"
+        env["VCPKG_OVERLAY_TRIPLETS"] = str(ROOT / "triplets")
 
     build_dir = ROOT / "build" / preset
     if args.clean and build_dir.exists():

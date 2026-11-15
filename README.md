@@ -33,6 +33,19 @@ python tools\build_native.py            Release + 测试（骨架模式，无需
 python tools\build_native.py --debug    Debug
 python tools\build_native.py --tests    构建并跑单元测试
 python tools\build_native.py --clean    清空重建
+python tools\build_native.py --full     协议引擎全量构建（需 vcpkg，见下）
+```
+
+### 协议依赖（vcpkg）
+
+vcpkg 位于 `C:\Users\wspne\source\vcpkg`，manifest baseline 已锁定。本机两个环境坑已固化成工具：
+
+1. **`reg.exe` 被安全策略拦截** → `vcvars64.bat` 与 vcpkg 自建构建环境均不可用。`build_native.py` 直接从文件系统组装 MSVC+SDK 环境（含 `WindowsSDKDir` 等 vcvars 级变量）；vcpkg 侧用自定义 triplet `triplets/x64-windows-static-ftpflow.cmake`（`VCPKG_ENV_PASSTHROUGH` 放行 + 钉死 `CMAKE_MT`/`CMAKE_RC_COMPILER`）。
+2. **代理偶发 502 / vcpkg 内置 curl HTTP2 分帧错误** → `tools/vcpkg_prefetch.py` 解析失败 URL，用系统 curl 重试下载并放入 downloads 缓存（vcpkg 会做哈希校验），循环直到安装成功。
+
+```bat
+python tools\vcpkg_prefetch.py          安装依赖（含预取重试，一次性）
+python tools\build_native.py --full     之后的全量构建
 ```
 
 试一下 CLI：
