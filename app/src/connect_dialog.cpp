@@ -13,6 +13,8 @@
 #include <QVBoxLayout>
 
 #include <cstdio>
+
+#include "ftpflow/known_hosts.hpp"
 #include <fstream>
 
 namespace ftpflow {
@@ -230,6 +232,8 @@ RemoteFsModel::ConnInfo ConnectDialog::connInfo() const {
     // Saved-site reference for credential recovery on restore.
     if (site_ && site_->currentIndex() > 0)
         ci.siteName = site_->currentText().toStdString();
+    // Strict host-key verification against the persistent known_hosts store.
+    ci.knownHostsPath = ftpflow::KnownHosts::defaultPath();
     return ci;
 }
 

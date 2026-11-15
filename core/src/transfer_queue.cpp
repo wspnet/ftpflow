@@ -241,9 +241,13 @@ std::vector<std::uint64_t> TransferQueue::enqueueTree(TransferRequest rootTempla
             return ids;
         }
     } else {
-        SftpSession sftp(HostKeyPolicy::AcceptNew);
+        const HostKeyPolicy hkPolicy = rootTemplate.trustedHostKeyHex.empty()
+            ? HostKeyPolicy::AcceptNew : HostKeyPolicy::Strict;
+        SftpSession sftp(hkPolicy);
         std::string acceptedKey;
-        const SftpResult r = sftp.open(rootTemplate.ssh, {}, &acceptedKey);
+        const SftpResult r = sftp.open(rootTemplate.ssh,
+                                       rootTemplate.trustedHostKeyHex,
+                                       &acceptedKey);
         if (!r.ok()) {
             if (error) *error = "sftp open: " + r.message;
             return ids;
@@ -398,6 +402,12 @@ void TransferQueue::runJob(Job* job) {
     TransferEvent ev;
     ev.jobId = job->id;
 
+    // Strict host-key verification when the caller supplied trusted blobs;
+    // otherwise trust-on-first-use (AcceptNew), the legacy default.
+    const HostKeyPolicy hkPolicy = req.trustedHostKeyHex.empty()
+        ? HostKeyPolicy::AcceptNew
+        : HostKeyPolicy::Strict;
+
     // --- pick the pipeline --------------------------------------------------
     TransferMode mode = TransferMode::Store;
     Decision decision;
@@ -471,9 +481,9 @@ void TransferQueue::runJob(Job* job) {
         finalState = TransferState::Failed;
     } else if (mode == TransferMode::Ftz1) {
         // ---- FTZ1 container pipeline (SFTP endpoints, both ways) --------
-        SftpSession sftp(HostKeyPolicy::AcceptNew);
+        SftpSession sftp(hkPolicy);
         std::string acceptedKey;
-        SftpResult r = sftp.open(req.ssh, {}, &acceptedKey);
+        SftpResult r = sftp.open(req.ssh, req.trustedHostKeyHex, &acceptedKey);
         if (!r.ok()) {
             error = std::string("sftp open: ") + r.message;
             finalState = TransferState::Failed;
@@ -597,9 +607,9 @@ void TransferQueue::runJob(Job* job) {
         // SFTP: reuse this worker's session when the endpoint matches.
         // (workerLoop owns the cache; for simplicity we re-open per job here
         // -- session caching arrives with the GUI connection manager.)
-        SftpSession sftp(HostKeyPolicy::AcceptNew);
+        SftpSession sftp(hkPolicy);
         std::string acceptedKey;
-        SftpResult r = sftp.open(req.ssh, {}, &acceptedKey);
+        SftpResult r = sftp.open(req.ssh, req.trustedHostKeyHex, &acceptedKey);
         if (!r.ok()) {
             error = std::string("sftp open: ") + r.message;
             finalState = TransferState::Failed;
@@ -650,9 +660,9 @@ void TransferQueue::runJob(Job* job) {
         std::unique_ptr<SftpSession> sftpHelper;
         if (req.direction == TransferDirection::Upload &&
             (req.ensureRemoteDir || req.resume)) {
-            sftpHelper = std::make_unique<SftpSession>(HostKeyPolicy::AcceptNew);
+            sftpHelper = std::make_unique<SftpSession>(hkPolicy);
             std::string hk;
-            if (sftpHelper->open(req.ssh, {}, &hk).ok()) {
+            if (sftpHelper->open(req.ssh, req.trustedHostKeyHex, &hk).ok()) {
                 if (req.ensureRemoteDir)
                     ensureRemoteDirSftp(*sftpHelper, req.remotePath);
                 if (req.resume) {
@@ -685,10 +695,10 @@ void TransferQueue::runJob(Job* job) {
             return;
         }
 
-        SshExec ssh(HostKeyPolicy::AcceptNew);
+        SshExec ssh(hkPolicy);
         std::string acceptedKey;
         SshResult r = ssh.open(req.ssh, buildPushCommand(req, resumeFrom > 0),
-                               {}, &acceptedKey);
+                               req.trustedHostKeyHex, &acceptedKey);
         if (!r.ok()) {
             error = std::string("ssh open: ") + r.message;
             finalState = TransferState::Failed;
@@ -728,10 +738,9 @@ void TransferQueue::runJob(Job* job) {
                     if (sftpHelper && sftpHelper->isOpen()) {
                         verify = std::move(sftpHelper);
                     } else {
-                        verify = std::make_unique<SftpSession>(
-                            HostKeyPolicy::AcceptNew);
+                        verify = std::make_unique<SftpSession>(hkPolicy);
                         std::string vk;
-                        verify->open(req.ssh, {}, &vk);
+                        verify->open(req.ssh, req.trustedHostKeyHex, &vk);
                     }
                     std::uint64_t remoteSize = 0;
                     if (verify->isOpen() &&

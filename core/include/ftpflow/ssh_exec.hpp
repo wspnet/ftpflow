@@ -35,6 +35,10 @@ struct SshResult {
     SshStatus status = SshStatus::Ok;
     std::string message;         // human-readable detail
     int libssh2Errno = 0;        // raw libssh2 errno when applicable
+    // When status is HostKeyRejected, this holds the observed host public-key
+    // blob as lowercase hex so the caller can show a fingerprint and (after
+    // user confirmation) persist it as trusted.
+    std::string observedHostKeyHex;
     bool ok() const { return status == SshStatus::Ok; }
 };
 

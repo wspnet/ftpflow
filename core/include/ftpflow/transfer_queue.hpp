@@ -86,6 +86,12 @@ struct TransferRequest {
     // journal stores it; restore() users match it against their site store
     // to re-supply the password/key. Empty = inline credentials (CLI).
     std::string siteName;
+
+    // Trusted host public-key blobs (lowercase hex) for strict SSH
+    // host-key verification. When non-empty, the SFTP/SSH backend verifies
+    // strictly; empty = trust-on-first-use (AcceptNew). Not journaled —
+    // restore() callers re-supply it from their known_hosts store.
+    std::vector<std::string> trustedHostKeyHex;
 };
 
 struct TransferEvent {

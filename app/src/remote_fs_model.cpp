@@ -7,6 +7,7 @@
 #include <cstdio>
 
 #include "ftpflow/tree_walk.hpp"
+#include "ftpflow/known_hosts.hpp"
 
 namespace ftpflow {
 namespace {
@@ -128,6 +129,22 @@ void RemoteFsModel::disconnect() {
     beginResetModel();
     endResetModel();
     emit disconnected();
+}
+
+void RemoteFsModel::trustHostKey(const QString& host, quint16 port,
+                                 const QString& keyHex) {
+    if (conn_.knownHostsPath.empty()) return;
+    KnownHosts kh(conn_.knownHostsPath);
+    std::string err;
+    const std::string blob =
+        KnownHosts::hexDecode(keyHex.toStdString());
+    if (!kh.trust(host.toStdString(), port, "ssh-rsa", blob, &err)) {
+        emit connectFailed(QString("无法保存主机密钥: %1")
+                               .arg(QString::fromStdString(err)));
+        return;
+    }
+    // Retry the connection with the now-trusted key.
+    connectTo(conn_);
 }
 
 void RemoteFsModel::enterDir(const std::string& dir) {
@@ -320,10 +337,34 @@ void RemoteFsModel::workerLoop() {
             sftp.reset();
             std::string error;
             if (t.conn.isSftp) {
-                auto s = std::make_unique<SftpSession>(HostKeyPolicy::AcceptNew);
+                // Strict host-key verification against known_hosts when a
+                // store path is configured; otherwise AcceptNew (legacy).
+                const bool verify = !t.conn.knownHostsPath.empty();
+                std::vector<std::string> trusted;
+                if (verify) {
+                    KnownHosts kh(t.conn.knownHostsPath);
+                    trusted = kh.trustedHexFor(t.conn.ssh.host, t.conn.ssh.port);
+                }
+                auto s = std::make_unique<SftpSession>(
+                    verify ? HostKeyPolicy::Strict : HostKeyPolicy::AcceptNew);
                 std::string acceptedKey;
-                SftpResult r = s->open(t.conn.ssh, {}, &acceptedKey);
-                if (!r.ok()) {
+                SftpResult r = s->open(t.conn.ssh, trusted, &acceptedKey);
+                if (verify && r.status == SftpStatus::HostKeyRejected &&
+                    !r.observedHostKeyHex.empty()) {
+                    // Ask the user (UI thread) to confirm the fingerprint.
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, host = t.conn.ssh.host, port = t.conn.ssh.port,
+                         keyHex = r.observedHostKeyHex] {
+                            emit hostKeyUnknown(
+                                QString::fromStdString(
+                                    KnownHosts::fingerprintOfHex(keyHex)),
+                                QString::fromStdString(host), port,
+                                QString::fromStdString(keyHex));
+                        },
+                        Qt::QueuedConnection);
+                    error = "SFTP 连接失败: 主机密钥未受信任，请在弹窗中确认";
+                } else if (!r.ok()) {
                     error = "SFTP 连接失败: " + r.message;
                 } else {
                     sftp = std::move(s);

@@ -24,6 +24,7 @@ target_sources(ftpflow_core PRIVATE
     src/ssh_transfer.cpp
     src/transfer_queue.cpp
     src/transfer_journal.cpp
+    src/known_hosts.cpp
     src/tree_walk.cpp
     src/ftp_session.cpp
     src/ftz1.cpp

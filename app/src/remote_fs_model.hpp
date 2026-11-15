@@ -39,6 +39,7 @@ public:
         std::string startDir;         // remote initial directory
         std::string pushCmdTemplate;  // SSH compress agent template (opt)
         std::string siteName;         // saved-site reference (cred recovery)
+        std::string knownHostsPath;   // host-key store ("" = no strict verify)
     };
 
     explicit RemoteFsModel(QObject* parent = nullptr);
@@ -48,6 +49,10 @@ public:
     // connectFailed().
     void connectTo(const ConnInfo& ci);
     void disconnect();
+
+    // Persist a host key as trusted and reconnect with strict verification.
+    // Called after the user confirms a hostKeyUnknown() prompt.
+    void trustHostKey(const QString& host, quint16 port, const QString& keyHex);
 
     bool isConnected() const { return connected_; }
     ConnInfo connInfo() const { return conn_; }
@@ -85,6 +90,10 @@ signals:
     void disconnected();
     void opFinished(const QString& message);
     void opFailed(const QString& message);
+    // Emitted on strict host-key rejection: carry the standard SHA256
+    // fingerprint and the observed blob hex for a trust-on-first-use prompt.
+    void hostKeyUnknown(const QString& fingerprint, const QString& host,
+                        quint16 port, const QString& keyHex);
 
 private:
     struct OpTarget {

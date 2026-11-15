@@ -44,6 +44,8 @@ private slots:
     void onRemoteBrowseFailed(const QString& msg);
     void onRemoteOpFailed(const QString& msg);
     void onRemoteContextMenu(const QPoint& pos);
+    void onHostKeyUnknown(const QString& fingerprint, const QString& host,
+                          quint16 port, const QString& keyHex);
 
     // Transfer dock interactions.
     void onTransferContextMenu(const QPoint& pos);

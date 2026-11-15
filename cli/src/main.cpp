@@ -23,8 +23,34 @@
 #include "ftpflow/ssh_transfer.hpp"
 #include "ftpflow/version.hpp"
 #include "ftpflow/vfs_local.hpp"
+#include "ftpflow/known_hosts.hpp"
 
 namespace {
+
+// ---- host-key verification policy ---------------------------------------
+// When empty, connections use AcceptNew (trust-on-first-use without
+// persistence) exactly as before. When set (via --known-hosts PATH), the
+// store is loaded, host keys are verified strictly, and unknown keys are
+// printed as standard SHA256 fingerprints and persisted on first use.
+std::string g_knownHostsPath;
+
+// Parse and consume a trailing --known-hosts <path> from `args`, returning
+// true if it was present.
+bool takeKnownHostsFlag(std::vector<std::string>& args) {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--known-hosts" && i + 1 < args.size()) {
+            g_knownHostsPath = args[i + 1];
+            args.erase(args.begin() + i, args.begin() + i + 2);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Convert a hex blob to its OpenSSH fingerprint string for display.
+std::string fingerprintOfBlobHex(const std::string& hex) {
+    return ftpflow::KnownHosts::fingerprintOfHex(hex);
+}
 
 int cmdVersion() {
     std::printf("ftpflow %s (ftpcli, core.lib shared)\n", ftpflow::versionString());
@@ -195,8 +221,17 @@ int cmdSshExec(const std::vector<std::string>& args) {
         return 2;
     }
 
-    ftpflow::SshExec ssh(ftpflow::HostKeyPolicy::AcceptNew);
+    const bool verify = !g_knownHostsPath.empty();
+    ftpflow::SshExec ssh(verify ? ftpflow::HostKeyPolicy::Strict
+                                : ftpflow::HostKeyPolicy::AcceptNew);
     std::string acceptedKey;
+
+    // Strict verification against the known_hosts store when configured.
+    std::vector<std::string> trusted;
+    if (verify) {
+        ftpflow::KnownHosts kh(g_knownHostsPath);
+        trusted = kh.trustedHexFor(ep.host, ep.port);
+    }
 
     // Capture remote stdout/stderr, printing each stream as it arrives.
     ssh.setStdoutSink([](const void* p, std::size_t n) {
@@ -206,7 +241,33 @@ int cmdSshExec(const std::vector<std::string>& args) {
         std::fwrite(p, 1, n, stderr);
     });
 
-    ftpflow::SshResult r = ssh.open(ep, command, {}, &acceptedKey);
+    ftpflow::SshResult r = ssh.open(ep, command, trusted, &acceptedKey);
+    if (verify && r.status == ftpflow::SshStatus::HostKeyRejected &&
+        !r.observedHostKeyHex.empty()) {
+        // Trust-on-first-use: show the standard fingerprint, persist, retry.
+        std::fprintf(stderr,
+            "WARNING: remote host key is not in %s\n"
+            "  fingerprint: %s\n"
+            "  trusting and retrying...\n",
+            g_knownHostsPath.c_str(),
+            fingerprintOfBlobHex(r.observedHostKeyHex).c_str());
+        ftpflow::KnownHosts kh(g_knownHostsPath);
+        std::string err;
+        if (!kh.trust(ep.host, ep.port, "ssh-rsa",
+                      ftpflow::KnownHosts::hexDecode(r.observedHostKeyHex),
+                      &err)) {
+            std::fprintf(stderr, "cannot persist host key: %s\n", err.c_str());
+            return 1;
+        }
+        ftpflow::SshExec retry(ftpflow::HostKeyPolicy::Strict);
+        retry.setStdoutSink([](const void* p, std::size_t n) {
+            std::fwrite(p, 1, n, stdout);
+        });
+        retry.setStderrSink([](const void* p, std::size_t n) {
+            std::fwrite(p, 1, n, stderr);
+        });
+        r = retry.open(ep, command, kh.trustedHexFor(ep.host, ep.port), nullptr);
+    }
     if (!r.ok()) {
         std::fprintf(stderr, "ssh open failed [%s]: %s\n",
             ftpflow::sshStatusName(r.status), r.message.c_str());
@@ -287,9 +348,52 @@ int cmdSshPush(const std::vector<std::string>& args) {
     for (std::size_t pos; (pos = command.find("{file}")) != std::string::npos;)
         command.replace(pos, 6, quoted);
 
-    ftpflow::SshExec ssh(ftpflow::HostKeyPolicy::AcceptNew);
+    const bool verify = !g_knownHostsPath.empty();
+    ftpflow::SshExec ssh(verify ? ftpflow::HostKeyPolicy::Strict
+                                : ftpflow::HostKeyPolicy::AcceptNew);
     std::string acceptedKey;
-    ftpflow::SshResult r = ssh.open(ep, command, {}, &acceptedKey);
+    std::vector<std::string> trusted;
+    if (verify) {
+        ftpflow::KnownHosts kh(g_knownHostsPath);
+        trusted = kh.trustedHexFor(ep.host, ep.port);
+    }
+    ftpflow::SshResult r = ssh.open(ep, command, trusted, &acceptedKey);
+    if (verify && r.status == ftpflow::SshStatus::HostKeyRejected &&
+        !r.observedHostKeyHex.empty()) {
+        std::fprintf(stderr,
+            "WARNING: remote host key is not in %s\n"
+            "  fingerprint: %s\n"
+            "  trusting and retrying...\n",
+            g_knownHostsPath.c_str(),
+            fingerprintOfBlobHex(r.observedHostKeyHex).c_str());
+        ftpflow::KnownHosts kh(g_knownHostsPath);
+        std::string err;
+        if (!kh.trust(ep.host, ep.port, "ssh-rsa",
+                      ftpflow::KnownHosts::hexDecode(r.observedHostKeyHex),
+                      &err)) {
+            std::fprintf(stderr, "cannot persist host key: %s\n", err.c_str());
+            return 1;
+        }
+        ftpflow::SshExec retry(ftpflow::HostKeyPolicy::Strict);
+        r = retry.open(ep, command, kh.trustedHexFor(ep.host, ep.port), nullptr);
+        if (!r.ok()) {
+            std::fprintf(stderr, "ssh open failed [%s]: %s\n",
+                ftpflow::sshStatusName(r.status), r.message.c_str());
+            return 1;
+        }
+        ftpflow::SshPushStats st2;
+        ftpflow::SshResult pr2 = ftpflow::sshPushFile(retry, local, opts, &st2);
+        if (!pr2.ok()) {
+            std::fprintf(stderr, "ssh push failed [%s]: %s\n",
+                ftpflow::sshStatusName(pr2.status), pr2.message.c_str());
+            return 1;
+        }
+        std::printf("pushed %llu -> %llu bytes (ratio %.1f%%, exit=%d, level=%d)\n",
+            static_cast<unsigned long long>(st2.localBytes),
+            static_cast<unsigned long long>(st2.compressedBytes),
+            st2.ratio() * 100.0, retry.exitCode(), opts.zstdLevel);
+        return 0;
+    }
     if (!r.ok()) {
         std::fprintf(stderr, "ssh open failed [%s]: %s\n",
             ftpflow::sshStatusName(r.status), r.message.c_str());
@@ -492,9 +596,43 @@ int cmdSftp(const std::vector<std::string>& a) {
         }
     }
 
-    ftpflow::SftpSession sftp(ftpflow::HostKeyPolicy::AcceptNew);
+    const bool verify = !g_knownHostsPath.empty();
+    ftpflow::SftpSession sftp(verify ? ftpflow::HostKeyPolicy::Strict
+                                     : ftpflow::HostKeyPolicy::AcceptNew);
     std::string acceptedKey;
-    ftpflow::SftpResult r = sftp.open(ep, {}, &acceptedKey);
+    std::vector<std::string> trusted;
+    if (verify) {
+        ftpflow::KnownHosts kh(g_knownHostsPath);
+        trusted = kh.trustedHexFor(ep.host, ep.port);
+    }
+    ftpflow::SftpResult r = sftp.open(ep, trusted, &acceptedKey);
+    if (verify && r.status == ftpflow::SftpStatus::HostKeyRejected &&
+        !r.observedHostKeyHex.empty()) {
+        std::fprintf(stderr,
+            "WARNING: remote host key is not in %s\n"
+            "  fingerprint: %s\n"
+            "  trusting and retrying...\n",
+            g_knownHostsPath.c_str(),
+            fingerprintOfBlobHex(r.observedHostKeyHex).c_str());
+        ftpflow::KnownHosts kh(g_knownHostsPath);
+        std::string err;
+        if (!kh.trust(ep.host, ep.port, "ssh-rsa",
+                      ftpflow::KnownHosts::hexDecode(r.observedHostKeyHex),
+                      &err)) {
+            std::fprintf(stderr, "cannot persist host key: %s\n", err.c_str());
+            return 1;
+        }
+        // Reopen this same session object is not possible (SftpSession is
+        // non-copyable), so rebuild a strict one against the now-trusted key.
+        ftpflow::SftpSession retry(ftpflow::HostKeyPolicy::Strict);
+        r = retry.open(ep, kh.trustedHexFor(ep.host, ep.port), nullptr);
+        if (!r.ok()) {
+            std::fprintf(stderr, "sftp open failed [%s]: %s\n",
+                ftpflow::sftpStatusName(r.status), r.message.c_str());
+            return 1;
+        }
+        sftp = std::move(retry);
+    }
     if (!r.ok()) {
         std::fprintf(stderr, "sftp open failed [%s]: %s\n",
             ftpflow::sftpStatusName(r.status), r.message.c_str());
@@ -798,12 +936,16 @@ int main(int argc, char** argv) {
             "  ftpcli zdecode                         stdin zstd -> stdout (agent)\n"
             "  ftpcli queue <ftp|sftp|ssh> ...        concurrent transfer queue\n"
             "         [--resume] continue partial transfers (byte-exact)\n"
-            "         [--ftz]    ship as FTZ1 containers (frame-verified)\n",
+            "         [--ftz]    ship as FTZ1 containers (frame-verified)\n"
+            "  --known-hosts <path>   strict host-key verify + persist (ssh/sftp/queue)\n",
             ftpflow::versionString());
         return args.empty() ? 2 : 0;
     }
     const std::string& cmd = args[0];
     std::vector<std::string> rest(args.begin() + 1, args.end());
+    // A trailing --known-hosts <path> enables strict host-key verification
+    // with persistence; strip it (applies to ssh/sftp/queue) before dispatch.
+    takeKnownHostsFlag(rest);
     if (cmd == "version") return cmdVersion();
     if (cmd == "decide") return cmdDecide(rest);
     if (cmd == "info") return cmdInfo(rest);

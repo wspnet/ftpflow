@@ -147,6 +147,7 @@ SshResult SshExec::open(const SshEndpoint& ep,
             close();
             SshResult r; r.status = SshStatus::HostKeyRejected;
             r.message = "unknown host key sha256-blob " + hex.substr(0, 32) + "...";
+            r.observedHostKeyHex = hex;   // full blob, for fingerprint display
             return r;
         }
         if (!trusted && acceptedHostKeyHex) *acceptedHostKeyHex = hex;

@@ -60,6 +60,9 @@ struct SftpResult {
     SftpStatus status = SftpStatus::Ok;
     std::string message;
     int libssh2Errno = 0;
+    // When status is HostKeyRejected, holds the observed host public-key blob
+    // as lowercase hex (for fingerprint display + trust-on-first-use).
+    std::string observedHostKeyHex;
     bool ok() const { return status == SftpStatus::Ok; }
 };
 
@@ -70,6 +73,8 @@ public:
 
     SftpSession(const SftpSession&) = delete;
     SftpSession& operator=(const SftpSession&) = delete;
+    SftpSession(SftpSession&& other) noexcept;
+    SftpSession& operator=(SftpSession&& other) noexcept;
 
     // Connect, handshake, verify host key (same contract as SshExec::open:
     // exact-match hex blobs; AcceptNew returns the observed blob), auth,

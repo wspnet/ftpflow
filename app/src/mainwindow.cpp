@@ -21,6 +21,7 @@
 #include <QWidget>
 
 #include "connect_dialog.hpp"
+#include "ftpflow/known_hosts.hpp"
 #include "ftpflow/protocol_status.hpp"
 #include "ftpflow/transfer_journal.hpp"
 #include "ftpflow/version.hpp"
@@ -85,6 +86,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                     r.ftp.user = r.ssh.user;
                     r.ftp.password = r.ssh.password;
                     r.pushCommandTemplate = e.pushCmd.toStdString();
+                    // Re-supply strict host-key verification from known_hosts.
+                    if (r.protocol == BackendKind::Sftp) {
+                        KnownHosts kh(KnownHosts::defaultPath());
+                        r.trustedHostKeyHex =
+                            kh.trustedHexFor(r.ssh.host, r.ssh.port);
+                    }
                     break;
                 }
             });
@@ -230,6 +237,8 @@ void MainWindow::buildUi() {
             &MainWindow::onRemoteConnected);
     connect(remote_, &RemoteFsModel::connectFailed, this,
             &MainWindow::onRemoteConnectFailed);
+    connect(remote_, &RemoteFsModel::hostKeyUnknown, this,
+            &MainWindow::onHostKeyUnknown);
     connect(remote_, &RemoteFsModel::browseFailed, this,
             &MainWindow::onRemoteBrowseFailed);
     connect(remote_, &RemoteFsModel::opFailed, this,
@@ -393,6 +402,30 @@ void MainWindow::onRemoteConnectFailed(const QString& msg) {
     statusBar()->showMessage(msg, 8000);
 }
 
+void MainWindow::onHostKeyUnknown(const QString& fingerprint,
+                                  const QString& host, quint16 port,
+                                  const QString& keyHex) {
+    connectBtn_->setEnabled(true);
+    disconnectBtn_->setEnabled(false);
+    remotePathEdit_->setText("未连接");
+    const QString detail =
+        QString("主机 %1:%2 的 SSH 密钥尚未受信任。\n\n"
+                "指纹 (SHA256):\n%3\n\n"
+                "请确认指纹与服务器一致后信任；若不一致请立即断开，"
+                "可能存在中间人攻击。")
+            .arg(host)
+            .arg(port)
+            .arg(fingerprint);
+    const auto choice = QMessageBox::warning(
+        this, "主机密钥确认", detail,
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (choice == QMessageBox::Yes) {
+        remote_->trustHostKey(host, port, keyHex);
+        connectBtn_->setEnabled(false);
+        remotePathEdit_->setText("连接中...");
+    }
+}
+
 void MainWindow::onRemoteBrowseFailed(const QString& msg) {
     statusBar()->showMessage(msg, 8000);
 }
@@ -513,6 +546,10 @@ void MainWindow::enqueueUploads() {
         req.ssh = ci.ssh;
         req.pushCommandTemplate = ci.pushCmdTemplate;
         req.siteName = ci.siteName;
+        if (ci.isSftp && !ci.knownHostsPath.empty()) {
+            KnownHosts kh(ci.knownHostsPath);
+            req.trustedHostKeyHex = kh.trustedHexFor(ci.ssh.host, ci.ssh.port);
+        }
 
         if (model_->isDir(src)) {
             // Recursive upload: one job per file under the tree.
@@ -555,6 +592,10 @@ void MainWindow::enqueueDownloads() {
         req.ftp = ci.ftp;
         req.ssh = ci.ssh;
         req.siteName = ci.siteName;
+        if (ci.isSftp && !ci.knownHostsPath.empty()) {
+            KnownHosts kh(ci.knownHostsPath);
+            req.trustedHostKeyHex = kh.trustedHexFor(ci.ssh.host, ci.ssh.port);
+        }
 
         if (remote_->isDir(src)) {
             std::string err;

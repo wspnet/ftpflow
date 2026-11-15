@@ -112,6 +112,25 @@ SftpSession::SftpSession(HostKeyPolicy policy) : policy_(policy) {
 
 SftpSession::~SftpSession() { close(); delete impl_; }
 
+SftpSession::SftpSession(SftpSession&& other) noexcept
+    : impl_(other.impl_), state_(other.state_), policy_(other.policy_) {
+    other.impl_ = nullptr;
+    other.state_ = State::Idle;
+}
+
+SftpSession& SftpSession::operator=(SftpSession&& other) noexcept {
+    if (this != &other) {
+        close();
+        delete impl_;
+        impl_ = other.impl_;
+        state_ = other.state_;
+        policy_ = other.policy_;
+        other.impl_ = nullptr;
+        other.state_ = State::Idle;
+    }
+    return *this;
+}
+
 SftpResult SftpSession::open(const SshEndpoint& ep,
                              const std::vector<std::string>& trustedHostKeyHex,
                              std::string* acceptedHostKeyHex) {
@@ -171,6 +190,7 @@ SftpResult SftpSession::open(const SshEndpoint& ep,
             close();
             SftpResult r; r.status = SftpStatus::HostKeyRejected;
             r.message = "unknown host key sha256-blob " + hex.substr(0, 32) + "...";
+            r.observedHostKeyHex = hex;   // full blob, for fingerprint display
             return r;
         }
         if (!trusted && acceptedHostKeyHex) *acceptedHostKeyHex = hex;
@@ -617,6 +637,24 @@ struct SftpSession::Impl {};
 
 SftpSession::SftpSession(HostKeyPolicy policy) : policy_(policy) {}
 SftpSession::~SftpSession() { delete impl_; }
+
+SftpSession::SftpSession(SftpSession&& other) noexcept
+    : impl_(other.impl_), state_(other.state_), policy_(other.policy_) {
+    other.impl_ = nullptr;
+    other.state_ = State::Idle;
+}
+
+SftpSession& SftpSession::operator=(SftpSession&& other) noexcept {
+    if (this != &other) {
+        delete impl_;
+        impl_ = other.impl_;
+        state_ = other.state_;
+        policy_ = other.policy_;
+        other.impl_ = nullptr;
+        other.state_ = State::Idle;
+    }
+    return *this;
+}
 
 SftpResult SftpSession::open(const SshEndpoint&, const std::vector<std::string>&,
                              std::string*) {
