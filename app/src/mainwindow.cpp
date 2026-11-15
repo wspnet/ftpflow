@@ -21,6 +21,7 @@
 #include <QShortcut>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QTabWidget>
 #include <QTableView>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -117,9 +118,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     reconnectTimer_ = new QTimer(this);
     reconnectTimer_->setSingleShot(true);
     connect(reconnectTimer_, &QTimer::timeout, this, [this] {
-        const auto ci = remote_->connInfo();
-        remotePathEdit_->setText("重连中...");
-        remote_->connectTo(ci);
+        RemoteTab* t = currentTab();
+        if (!t) return;
+        const auto ci = t->model->connInfo();
+        t->pathEdit->setText("重连中...");
+        t->model->connectTo(ci);
     });
 }
 
@@ -204,111 +207,28 @@ void MainWindow::buildUi() {
     connect(downloadBtn, &QPushButton::clicked, this,
             &MainWindow::enqueueDownloads);
 
-    // --- remote pane (right) -------------------------------------------------
+    // --- remote pane (right): tabbed, one session per tab ------------------
     auto* rightPane = new QWidget(this);
     auto* rightLay = new QVBoxLayout(rightPane);
     rightLay->setContentsMargins(0, 0, 0, 0);
     auto* rightTitle = new QLabel("远端", rightPane);
     rightTitle->setObjectName("paneTitle");
-    auto* remoteBar = new QWidget(rightPane);
-    auto* remoteBarLay = new QHBoxLayout(remoteBar);
-    remoteBarLay->setContentsMargins(2, 0, 2, 0);
-    remotePathEdit_ = new QLineEdit(remoteBar);
-    remotePathEdit_->setPlaceholderText("未连接（点“连接...”打开远端）");
-    remotePathEdit_->setReadOnly(true);
-    remotePathEdit_->setClearButtonEnabled(true);
-    // Address-bar navigation: type an absolute remote path and press Enter
-    // (XTerminal-style). Only meaningful once connected.
-    connect(remotePathEdit_, &QLineEdit::returnPressed, this, [this] {
-        if (!remote_->isConnected()) return;
-        const QString p = remotePathEdit_->text().trimmed();
-        if (p.isEmpty()) return;
-        remote_->enterDir(p.toStdString());
-    });
-    connectBtn_ = new QPushButton("连接...", remoteBar);
-    disconnectBtn_ = new QPushButton("断开", remoteBar);
-    auto* remoteUpBtn = new QPushButton("向上", remoteBar);
-    auto* remoteRefreshBtn = new QPushButton("刷新", remoteBar);
-    disconnectBtn_->setEnabled(false);
-    remoteUpBtn->setEnabled(false);
-    remoteRefreshBtn->setEnabled(false);
-    remoteBarLay->addWidget(remotePathEdit_, 1);
-    remoteBarLay->addWidget(connectBtn_);
-    remoteBarLay->addWidget(disconnectBtn_);
-    remoteBarLay->addWidget(remoteUpBtn);
-    remoteBarLay->addWidget(remoteRefreshBtn);
-
-    remote_ = new RemoteFsModel(this);
-    remoteProxy_ = new QSortFilterProxyModel(this);
-    remoteProxy_->setSourceModel(remote_);
-    remoteProxy_->setSortRole(Qt::DisplayRole);
-    rightTable_ = new QTableView(rightPane);
-    rightTable_->setModel(remoteProxy_);
-    rightTable_->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
-    rightTable_->verticalHeader()->setDefaultSectionSize(22);
-    rightTable_->setShowGrid(false);
-    rightTable_->setAlternatingRowColors(true);
-    rightTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    rightTable_->setSelectionMode(QAbstractItemView::ExtendedSelection);
-    rightTable_->setSortingEnabled(true);
-    rightTable_->horizontalHeader()->setSectionResizeMode(0,
-                                                          QHeaderView::Stretch);
-    rightTable_->verticalHeader()->hide();
-    rightTable_->horizontalHeader()->setSortIndicator(0, Qt::AscendingOrder);
+    remoteTabs_ = new QTabWidget(rightPane);
+    remoteTabs_->setDocumentMode(true);
+    remoteTabs_->setTabsClosable(true);
+    remoteTabs_->setMovable(true);
+    // "+" button to open another session (XTerminal multi-tab).
+    auto* newTabBtn = new QPushButton("＋", remoteTabs_);
+    newTabBtn->setFixedSize(24, 24);
+    newTabBtn->setToolTip("新建会话标签");
+    connect(newTabBtn, &QPushButton::clicked, this,
+            &MainWindow::onNewRemoteTab);
+    remoteTabs_->setCornerWidget(newTabBtn, Qt::TopRightCorner);
     rightLay->addWidget(rightTitle);
-    rightLay->addWidget(remoteBar);
-    rightLay->addWidget(rightTable_, 1);
-    // Drag & drop: remote pane is a drag source (downloads) and drop target
-    // (uploads from local).
-    rightTable_->setDragEnabled(true);
-    rightTable_->setAcceptDrops(true);
-    rightTable_->setDragDropMode(QAbstractItemView::DragDrop);
-    rightTable_->setDefaultDropAction(Qt::CopyAction);
-    rightTable_->viewport()->installEventFilter(this);
-    // F2 inline rename (XTerminal / Explorer convention).
-    auto* renameShortcut = new QShortcut(QKeySequence(Qt::Key_F2), rightTable_);
-    renameShortcut->setContext(Qt::WidgetShortcut);
-    connect(renameShortcut, &QShortcut::activated, this,
-            &MainWindow::renameRemoteSelected);
-
-    connect(connectBtn_, &QPushButton::clicked, this, &MainWindow::onConnect);
-    connect(disconnectBtn_, &QPushButton::clicked, this,
-            &MainWindow::onDisconnect);
-    connect(remoteUpBtn, &QPushButton::clicked, this, &MainWindow::onRemoteUp);
-    connect(remoteRefreshBtn, &QPushButton::clicked, this,
-            &MainWindow::onRemoteRefresh);
-    connect(rightTable_, &QTableView::doubleClicked, this,
-            [this](const QModelIndex& idx) {
-                onRemoteActivated(remoteProxy_->mapToSource(idx));
-            });
-    connect(remote_, &RemoteFsModel::connected, this,
-            &MainWindow::onRemoteConnected);
-    connect(remote_, &RemoteFsModel::connectFailed, this,
-            &MainWindow::onRemoteConnectFailed);
-    connect(remote_, &RemoteFsModel::hostKeyUnknown, this,
-            &MainWindow::onHostKeyUnknown);
-    connect(remote_, &RemoteFsModel::browseFailed, this,
-            &MainWindow::onRemoteBrowseFailed);
-    connect(remote_, &RemoteFsModel::opFailed, this,
-            &MainWindow::onRemoteOpFailed);
-    connect(remote_, &RemoteFsModel::connectionLost, this,
-            &MainWindow::onConnectionLost);
-    // Right-click: remote file operations.
-    rightTable_->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(rightTable_, &QTableView::customContextMenuRequested, this,
-            &MainWindow::onRemoteContextMenu);
-    // Enable/disable the navigation buttons with connection state.
-    connect(remote_, &RemoteFsModel::connected, this, [this, remoteUpBtn,
-                                                       remoteRefreshBtn] {
-        remoteUpBtn->setEnabled(true);
-        remoteRefreshBtn->setEnabled(true);
-    });
-    connect(remote_, &RemoteFsModel::disconnected, this,
-            [this, remoteUpBtn, remoteRefreshBtn] {
-                remoteUpBtn->setEnabled(false);
-                remoteRefreshBtn->setEnabled(false);
-                remotePathEdit_->setText("未连接");
-            });
+    rightLay->addWidget(remoteTabs_, 1);
+    connect(remoteTabs_, &QTabWidget::tabCloseRequested, this,
+            &MainWindow::onTabClosed);
+    addRemoteTab();   // initial tab
 
     // --- splitters -------------------------------------------------------------
     auto* splitter = new QSplitter(Qt::Horizontal, this);
@@ -400,6 +320,195 @@ void MainWindow::buildUi() {
     }
 }
 
+// ---- remote tabs -----------------------------------------------------------
+
+MainWindow::RemoteTab* MainWindow::currentTab() {
+    const int i = remoteTabs_->currentIndex();
+    if (i < 0 || i >= tabs_.size()) return nullptr;
+    return tabs_[i];
+}
+
+const MainWindow::RemoteTab* MainWindow::currentTab() const {
+    const int i = remoteTabs_->currentIndex();
+    if (i < 0 || i >= tabs_.size()) return nullptr;
+    return tabs_[i];
+}
+
+RemoteFsModel* MainWindow::currentRemote() const {
+    const RemoteTab* t = currentTab();
+    return t ? t->model : nullptr;
+}
+
+MainWindow::RemoteTab* MainWindow::addRemoteTab() {
+    auto* tab = new RemoteTab;
+    auto* page = new QWidget(remoteTabs_);
+    auto* pageLay = new QVBoxLayout(page);
+    pageLay->setContentsMargins(0, 0, 0, 0);
+
+    // Address bar + nav/connect buttons.
+    auto* remoteBar = new QWidget(page);
+    auto* remoteBarLay = new QHBoxLayout(remoteBar);
+    remoteBarLay->setContentsMargins(2, 0, 2, 0);
+    tab->pathEdit = new QLineEdit(remoteBar);
+    tab->pathEdit->setPlaceholderText("未连接（点“连接...”打开远端）");
+    tab->pathEdit->setReadOnly(true);
+    tab->pathEdit->setClearButtonEnabled(true);
+    tab->connectBtn = new QPushButton("连接...", remoteBar);
+    tab->disconnectBtn = new QPushButton("断开", remoteBar);
+    tab->upBtn = new QPushButton("向上", remoteBar);
+    tab->refreshBtn = new QPushButton("刷新", remoteBar);
+    tab->disconnectBtn->setEnabled(false);
+    tab->upBtn->setEnabled(false);
+    tab->refreshBtn->setEnabled(false);
+    remoteBarLay->addWidget(tab->pathEdit, 1);
+    remoteBarLay->addWidget(tab->connectBtn);
+    remoteBarLay->addWidget(tab->disconnectBtn);
+    remoteBarLay->addWidget(tab->upBtn);
+    remoteBarLay->addWidget(tab->refreshBtn);
+
+    // Model/proxy are children of MainWindow (not the page) so they survive
+    // independently; onTabClosed() deletes them explicitly.
+    tab->model = new RemoteFsModel(this);
+    tab->proxy = new QSortFilterProxyModel(this);
+    tab->proxy->setSourceModel(tab->model);
+    tab->proxy->setSortRole(Qt::DisplayRole);
+    tab->table = new QTableView(page);
+    tab->table->setModel(tab->proxy);
+    tab->table->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
+    tab->table->verticalHeader()->setDefaultSectionSize(22);
+    tab->table->setShowGrid(false);
+    tab->table->setAlternatingRowColors(true);
+    tab->table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tab->table->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    tab->table->setSortingEnabled(true);
+    tab->table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    tab->table->verticalHeader()->hide();
+    tab->table->horizontalHeader()->setSortIndicator(0, Qt::AscendingOrder);
+    pageLay->addWidget(remoteBar);
+    pageLay->addWidget(tab->table, 1);
+
+    // Drag & drop + F2 rename (per tab).
+    tab->table->setDragEnabled(true);
+    tab->table->setAcceptDrops(true);
+    tab->table->setDragDropMode(QAbstractItemView::DragDrop);
+    tab->table->setDefaultDropAction(Qt::CopyAction);
+    tab->table->viewport()->installEventFilter(this);
+    auto* renameShortcut = new QShortcut(QKeySequence(Qt::Key_F2), tab->table);
+    renameShortcut->setContext(Qt::WidgetShortcut);
+    connect(renameShortcut, &QShortcut::activated, this,
+            &MainWindow::renameRemoteSelected);
+
+    // Wire this tab's widgets/models. Lambdas capture the stable `tab`
+    // pointer so every signal targets the right tab, even a background one.
+    connect(tab->pathEdit, &QLineEdit::returnPressed, this, [this, tab] {
+        if (!tab->model->isConnected()) return;
+        const QString p = tab->pathEdit->text().trimmed();
+        if (p.isEmpty()) return;
+        tab->model->enterDir(p.toStdString());
+    });
+    connect(tab->connectBtn, &QPushButton::clicked, this, [this, tab] {
+        ConnectDialog dlg(this, &siteStore_);
+        if (dlg.exec() != QDialog::Accepted) return;
+        tab->connectBtn->setEnabled(false);
+        tab->pathEdit->setText("连接中...");
+        tab->model->connectTo(dlg.connInfo());
+    });
+    connect(tab->disconnectBtn, &QPushButton::clicked, this, [this, tab] {
+        reconnectTimer_->stop();
+        tab->model->disconnect();
+        tab->connectBtn->setEnabled(true);
+        tab->disconnectBtn->setEnabled(false);
+        tab->pathEdit->setReadOnly(true);
+        tab->pathEdit->setText("未连接");
+    });
+    connect(tab->upBtn, &QPushButton::clicked, this, [this, tab] {
+        tab->model->goUp();
+        tab->pathEdit->setText(QString::fromStdString(tab->model->currentPath()));
+    });
+    connect(tab->refreshBtn, &QPushButton::clicked, this, [this, tab] {
+        tab->model->refresh();
+    });
+    connect(tab->table, &QTableView::doubleClicked, this, [this, tab](
+            const QModelIndex& i) {
+        if (!i.isValid() || !tab->model->isConnected()) return;
+        const QModelIndex src = tab->proxy->mapToSource(i);
+        if (tab->model->isDir(src)) {
+            tab->model->enterDir(tab->model->pathAt(src));
+            tab->pathEdit->setText(
+                QString::fromStdString(tab->model->currentPath()));
+        }
+    });
+    connect(tab->table, &QTableView::customContextMenuRequested, this,
+            [this, tab](const QPoint& pos) {
+                onRemoteContextMenu(*tab, pos);
+            });
+
+    connect(tab->model, &RemoteFsModel::connected, this, [this, tab] {
+        reconnectTimer_->stop();
+        tab->connectBtn->setEnabled(false);
+        tab->disconnectBtn->setEnabled(true);
+        tab->upBtn->setEnabled(true);
+        tab->refreshBtn->setEnabled(true);
+        tab->pathEdit->setReadOnly(false);
+        tab->pathEdit->setText(QString::fromStdString(tab->model->currentPath()));
+        refreshStatusBar();
+    });
+    connect(tab->model, &RemoteFsModel::connectFailed, this,
+            [this, tab](const QString& msg) {
+        tab->connectBtn->setEnabled(true);
+        tab->disconnectBtn->setEnabled(false);
+        tab->pathEdit->setReadOnly(true);
+        tab->pathEdit->setText("未连接");
+        statusBar()->showMessage(msg, 8000);
+    });
+    connect(tab->model, &RemoteFsModel::hostKeyUnknown, this,
+            [this, tab](const QString& fp, const QString& host, quint16 port,
+                        const QString& keyHex) {
+        onHostKeyUnknown(*tab, fp, host, port, keyHex);
+    });
+    connect(tab->model, &RemoteFsModel::browseFailed, this,
+            [this](const QString& msg) { statusBar()->showMessage(msg, 8000); });
+    connect(tab->model, &RemoteFsModel::opFailed, this,
+            [this](const QString& msg) { statusBar()->showMessage(msg, 8000); });
+    connect(tab->model, &RemoteFsModel::connectionLost, this,
+            [this, tab](const QString& msg) {
+        tab->disconnectBtn->setEnabled(false);
+        tab->pathEdit->setReadOnly(true);
+        tab->pathEdit->setText("连接已断开，准备重连...");
+        statusBar()->showMessage(
+            QString("连接已断开：%1（自动重连中...）").arg(msg), 8000);
+        reconnectTimer_->start(1500);
+    });
+    connect(tab->model, &RemoteFsModel::disconnected, this, [this, tab] {
+        tab->upBtn->setEnabled(false);
+        tab->refreshBtn->setEnabled(false);
+        tab->pathEdit->setText("未连接");
+    });
+
+    const int idx = tabs_.size();
+    tabs_.append(tab);
+    remoteTabs_->addTab(page, QString("会话 %1").arg(idx + 1));
+    remoteTabs_->setCurrentIndex(idx);
+    return tab;
+}
+
+void MainWindow::onNewRemoteTab() {
+    addRemoteTab();
+}
+
+void MainWindow::onTabClosed(int index) {
+    if (tabs_.size() <= 1) return;   // keep at least one tab
+    RemoteTab* t = tabs_[index];
+    tabs_.removeAt(index);
+    remoteTabs_->removeTab(index);   // deletes the page + its child widgets
+    // model/proxy are MainWindow children (not page children): delete them
+    // explicitly. Their destructors stop the worker thread cleanly.
+    t->proxy->setSourceModel(nullptr);
+    delete t->proxy;
+    delete t->model;
+    delete t;
+}
+
 void MainWindow::showRoot(const std::string& root) {
     std::string err;
     if (!model_->openRoot(root, &err)) {
@@ -435,48 +544,15 @@ void MainWindow::onVerdictsReady() {
     refreshStatusBar();
 }
 
-// ---- remote pane ------------------------------------------------------------
+// ---- remote pane (per-tab handlers) ---------------------------------------
 
-void MainWindow::onConnect() {
-    ConnectDialog dlg(this, &siteStore_);
-    if (dlg.exec() != QDialog::Accepted) return;
-    connectBtn_->setEnabled(false);
-    remotePathEdit_->setText("连接中...");
-    remote_->connectTo(dlg.connInfo());
-}
-
-void MainWindow::onDisconnect() {
-    reconnectTimer_->stop();
-    remote_->disconnect();
-    connectBtn_->setEnabled(true);
-    disconnectBtn_->setEnabled(false);
-    remotePathEdit_->setReadOnly(true);
-}
-
-void MainWindow::onRemoteConnected() {
-    reconnectTimer_->stop();
-    connectBtn_->setEnabled(false);
-    disconnectBtn_->setEnabled(true);
-    remotePathEdit_->setReadOnly(false);
-    remotePathEdit_->setText(QString::fromStdString(remote_->currentPath()));
-    refreshStatusBar();
-}
-
-void MainWindow::onRemoteConnectFailed(const QString& msg) {
-    connectBtn_->setEnabled(true);
-    disconnectBtn_->setEnabled(false);
-    remotePathEdit_->setReadOnly(true);
-    remotePathEdit_->setText("未连接");
-    statusBar()->showMessage(msg, 8000);
-}
-
-void MainWindow::onHostKeyUnknown(const QString& fingerprint,
+void MainWindow::onHostKeyUnknown(RemoteTab& tab, const QString& fingerprint,
                                   const QString& host, quint16 port,
                                   const QString& keyHex) {
-    connectBtn_->setEnabled(true);
-    disconnectBtn_->setEnabled(false);
-    remotePathEdit_->setReadOnly(true);
-    remotePathEdit_->setText("未连接");
+    tab.connectBtn->setEnabled(true);
+    tab.disconnectBtn->setEnabled(false);
+    tab.pathEdit->setReadOnly(true);
+    tab.pathEdit->setText("未连接");
     const QString detail =
         QString("主机 %1:%2 的 SSH 密钥尚未受信任。\n\n"
                 "指纹 (SHA256):\n%3\n\n"
@@ -489,55 +565,17 @@ void MainWindow::onHostKeyUnknown(const QString& fingerprint,
         this, "主机密钥确认", detail,
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (choice == QMessageBox::Yes) {
-        remote_->trustHostKey(host, port, keyHex);
-        connectBtn_->setEnabled(false);
-        remotePathEdit_->setText("连接中...");
+        tab.model->trustHostKey(host, port, keyHex);
+        tab.connectBtn->setEnabled(false);
+        tab.pathEdit->setText("连接中...");
     }
 }
 
-void MainWindow::onRemoteBrowseFailed(const QString& msg) {
-    statusBar()->showMessage(msg, 8000);
-}
-
-void MainWindow::onConnectionLost(const QString& msg) {
-    // The remote transport dropped. Show the cause and schedule a one-shot
-    // reconnect (reusing the saved connection info). If it fails, the normal
-    // connectFailed path restores the "未连接" UI for a manual retry.
-    disconnectBtn_->setEnabled(false);
-    remotePathEdit_->setReadOnly(true);
-    remotePathEdit_->setText("连接已断开，准备重连...");
-    statusBar()->showMessage(
-        QString("连接已断开：%1（自动重连中...）").arg(msg), 8000);
-    reconnectTimer_->start(1500);
-}
-
-void MainWindow::onRemoteUp() {
-    remote_->goUp();
-    remotePathEdit_->setText(QString::fromStdString(remote_->currentPath()));
-}
-
-void MainWindow::onRemoteRefresh() {
-    remote_->refresh();
-}
-
-void MainWindow::onRemoteActivated(const QModelIndex& idx) {
-    if (!idx.isValid() || !remote_->isConnected()) return;
-    if (remote_->isDir(idx)) {
-        remote_->enterDir(remote_->pathAt(idx));
-        remotePathEdit_->setText(
-            QString::fromStdString(remote_->currentPath()));
-    }
-}
-
-void MainWindow::onRemoteOpFailed(const QString& msg) {
-    statusBar()->showMessage(msg, 8000);
-}
-
-void MainWindow::onRemoteContextMenu(const QPoint& pos) {
-    if (!remote_->isConnected()) return;
-    const QModelIndex proxyIdx = rightTable_->indexAt(pos);
-    const QModelIndex idx =
-        proxyIdx.isValid() ? remoteProxy_->mapToSource(proxyIdx) : QModelIndex();
+void MainWindow::onRemoteContextMenu(RemoteTab& tab, const QPoint& pos) {
+    if (!tab.model->isConnected()) return;
+    const QModelIndex proxyIdx = tab.table->indexAt(pos);
+    const QModelIndex idx = proxyIdx.isValid()
+        ? tab.proxy->mapToSource(proxyIdx) : QModelIndex();
 
     QMenu menu(this);
     QAction* mkdirAction = menu.addAction("新建文件夹...");
@@ -550,27 +588,27 @@ void MainWindow::onRemoteContextMenu(const QPoint& pos) {
         removeAction->setEnabled(false);
     }
 
-    QAction* chosen = menu.exec(rightTable_->viewport()->mapToGlobal(pos));
+    QAction* chosen = menu.exec(tab.table->viewport()->mapToGlobal(pos));
     if (!chosen) return;
     if (chosen == mkdirAction) {
         bool ok = false;
         const QString name = QInputDialog::getText(
             this, "新建文件夹", "文件夹名称:", QLineEdit::Normal, {}, &ok);
         if (ok && !name.trimmed().isEmpty()) {
-            remote_->makeDir(name.trimmed().toStdString());
+            tab.model->makeDir(name.trimmed().toStdString());
         }
     } else if (chosen == renameAction) {
         renameRemoteSelected();
     } else if (chosen == removeAction) {
-        QModelIndexList rows = rightTable_->selectionModel()->selectedRows(0);
+        QModelIndexList rows = tab.table->selectionModel()->selectedRows(0);
         if (rows.isEmpty()) rows = {proxyIdx};
         QStringList names;
         QModelIndexList srcRows;
         for (const QModelIndex& r : rows) {
-            const QModelIndex src = remoteProxy_->mapToSource(r);
+            const QModelIndex src = tab.proxy->mapToSource(r);
             if (!src.isValid()) continue;
             srcRows.push_back(src);
-            names << QString::fromStdString(remote_->nameAt(src));
+            names << QString::fromStdString(tab.model->nameAt(src));
         }
         if (srcRows.isEmpty()) return;
         const QString message = QString(
@@ -581,37 +619,44 @@ void MainWindow::onRemoteContextMenu(const QPoint& pos) {
         if (QMessageBox::warning(this, "删除确认", message,
                                  QMessageBox::Yes | QMessageBox::No,
                                  QMessageBox::No) == QMessageBox::Yes) {
-            remote_->removeEntries(srcRows);
+            tab.model->removeEntries(srcRows);
         }
     } else if (chosen == refreshAction) {
-        remote_->refresh();
+        tab.model->refresh();
     }
 }
 
 void MainWindow::renameRemoteSelected() {
-    if (!remote_->isConnected()) return;
-    const QModelIndex proxyIdx = rightTable_->currentIndex();
+    RemoteTab* tab = currentTab();
+    if (!tab || !tab->model->isConnected()) return;
+    const QModelIndex proxyIdx = tab->table->currentIndex();
     if (!proxyIdx.isValid()) return;
-    const QModelIndex idx = remoteProxy_->mapToSource(proxyIdx);
+    const QModelIndex idx = tab->proxy->mapToSource(proxyIdx);
     if (!idx.isValid()) return;
     bool ok = false;
-    const QString oldName = QString::fromStdString(remote_->nameAt(idx));
+    const QString oldName = QString::fromStdString(tab->model->nameAt(idx));
     const QString name = QInputDialog::getText(
         this, "重命名", "新名称:", QLineEdit::Normal, oldName, &ok);
     if (ok && !name.trimmed().isEmpty() && name != oldName) {
-        remote_->renameEntry(idx, name.trimmed().toStdString());
+        tab->model->renameEntry(idx, name.trimmed().toStdString());
     }
 }
 
 // ---- drag & drop -----------------------------------------------------------
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    // Which remote tab (if any) does this viewport belong to?
+    int tabIdx = -1;
+    for (int i = 0; i < tabs_.size(); ++i) {
+        if (tabs_[i]->table->viewport() == watched) { tabIdx = i; break; }
+    }
+    const bool onRemote = tabIdx >= 0;
+    const bool onLocal = watched == left_->viewport();
+
     if (event->type() == QEvent::DragEnter ||
         event->type() == QEvent::DragMove) {
         auto* de = static_cast<QDragEnterEvent*>(event);
         const QMimeData* m = de->mimeData();
-        const bool onRemote = watched == rightTable_->viewport();
-        const bool onLocal = watched == left_->viewport();
         const bool ok =
             (onRemote && m->hasFormat("application/x-ftpflow-local-paths")) ||
             (onLocal && m->hasFormat("application/x-ftpflow-remote-paths"));
@@ -624,16 +669,17 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
     if (event->type() == QEvent::Drop) {
         auto* de = static_cast<QDropEvent*>(event);
         const QMimeData* m = de->mimeData();
-        if (watched == rightTable_->viewport() &&
+        if (onRemote &&
             m->hasFormat("application/x-ftpflow-local-paths")) {
             const QStringList paths = QString::fromUtf8(
                 m->data("application/x-ftpflow-local-paths"))
                 .split('\n', Qt::SkipEmptyParts);
             de->acceptProposedAction();
+            remoteTabs_->setCurrentIndex(tabIdx);   // target the dropped tab
             enqueueLocalToRemote(paths);
             return true;
         }
-        if (watched == left_->viewport() &&
+        if (onLocal &&
             m->hasFormat("application/x-ftpflow-remote-paths")) {
             const QStringList paths = QString::fromUtf8(
                 m->data("application/x-ftpflow-remote-paths"))
@@ -668,13 +714,14 @@ TransferRequest makeRequest(const RemoteFsModel::ConnInfo& ci) {
 }  // namespace
 
 void MainWindow::enqueueLocalToRemote(const QStringList& localPaths) {
-    if (!remote_->isConnected()) {
+    RemoteFsModel* rm = currentRemote();
+    if (!rm || !rm->isConnected()) {
         statusBar()->showMessage("请先连接远端", 4000);
         return;
     }
     if (localPaths.isEmpty()) return;
-    const auto ci = remote_->connInfo();
-    const std::string remoteDir = remote_->currentPath();
+    const auto ci = rm->connInfo();
+    const std::string remoteDir = rm->currentPath();
     for (const QString& localPath : localPaths) {
         const QFileInfo fi(localPath);
         if (!fi.exists()) continue;
@@ -702,12 +749,13 @@ void MainWindow::enqueueLocalToRemote(const QStringList& localPaths) {
 }
 
 void MainWindow::enqueueRemoteToLocal(const QStringList& remotePaths) {
-    if (!remote_->isConnected()) {
+    RemoteFsModel* rm = currentRemote();
+    if (!rm || !rm->isConnected()) {
         statusBar()->showMessage("请先连接远端", 4000);
         return;
     }
     if (remotePaths.isEmpty()) return;
-    const auto ci = remote_->connInfo();
+    const auto ci = rm->connInfo();
     const std::string localDir = model_->currentDirFullPath();
     for (const QString& remotePath : remotePaths) {
         // A trailing slash marks a directory (set by the drag source).
@@ -738,7 +786,8 @@ void MainWindow::enqueueRemoteToLocal(const QStringList& remotePaths) {
 }
 
 void MainWindow::enqueueUploads() {
-    if (!remote_->isConnected()) {
+    RemoteFsModel* rm = currentRemote();
+    if (!rm || !rm->isConnected()) {
         statusBar()->showMessage("请先连接远端", 4000);
         return;
     }
@@ -757,21 +806,23 @@ void MainWindow::enqueueUploads() {
 }
 
 void MainWindow::enqueueDownloads() {
-    if (!remote_->isConnected()) {
+    RemoteFsModel* rm = currentRemote();
+    if (!rm || !rm->isConnected()) {
         statusBar()->showMessage("请先连接远端", 4000);
         return;
     }
-    const QModelIndexList rows = rightTable_->selectionModel()->selectedRows(0);
+    RemoteTab* tab = currentTab();
+    const QModelIndexList rows = tab->table->selectionModel()->selectedRows(0);
     if (rows.isEmpty()) {
         statusBar()->showMessage("未选中远端条目", 4000);
         return;
     }
     QStringList paths;
     for (const QModelIndex& proxyIdx : rows) {
-        const QModelIndex src = remoteProxy_->mapToSource(proxyIdx);
-        std::string p = remote_->pathAt(src);
+        const QModelIndex src = tab->proxy->mapToSource(proxyIdx);
+        std::string p = rm->pathAt(src);
         if (p.empty()) continue;
-        if (remote_->isDir(src)) p += "/";
+        if (rm->isDir(src)) p += "/";
         paths << QString::fromStdString(p);
     }
     enqueueRemoteToLocal(paths);
@@ -788,8 +839,8 @@ void MainWindow::onTransferEvent(const TransferEvent& ev) {
         auto* bar = new QProgressBar;
         bar->setRange(0, 1000);
         bar->setValue(0);
-        bar->setTextVisible(false);
-        bar->setFixedHeight(14);
+        bar->setTextVisible(true);
+        bar->setFixedHeight(18);
         transferList_->setItemWidget(item, bar);
 
         JobUi ui;
@@ -802,8 +853,9 @@ void MainWindow::onTransferEvent(const TransferEvent& ev) {
     refreshTransferItem(ev.jobId, &ev);
 
     // Uploads may have changed the remote directory: refresh on finish.
-    if (ev.kind == TransferEvent::Kind::Finished && remote_->isConnected()) {
-        remote_->refresh();
+    if (ev.kind == TransferEvent::Kind::Finished) {
+        RemoteFsModel* rm = currentRemote();
+        if (rm && rm->isConnected()) rm->refresh();
     }
 }
 
@@ -874,10 +926,23 @@ void MainWindow::refreshTransferItem(std::uint64_t jobId,
     }
     it->second->setText(text);
 
-    // Progress bar.
+    // Progress bar: color by direction/state, text shows percent.
     if (auto* bar = qobject_cast<QProgressBar*>(
             transferList_->itemWidget(it->second))) {
         bar->setValue((int)(ui.pct * 10.0));
+        bar->setFormat(QString("%1%").arg(ui.pct, 0, 'f', 0));
+        // Upload = teal, download = blue, done = green, fail = red,
+        // paused = gray.
+        QString chunk;
+        if (ui.state == TransferState::Failed) chunk = "#f48771";
+        else if (ui.state == TransferState::Done) chunk = "#4ec9b0";
+        else if (ui.paused) chunk = "#9d9d9d";
+        else if (ui.state == TransferState::Canceled) chunk = "#6a6a6a";
+        else if (ui.direction == "下载") chunk = "#569cd6";
+        else chunk = "#2ea8c0";
+        bar->setStyleSheet(
+            QString("QProgressBar::chunk { background-color: %1; }")
+                .arg(chunk));
     }
 }
 
@@ -989,8 +1054,9 @@ void MainWindow::refreshStatusBar() {
         ? QString("(root)")
         : QString::fromStdString(rel);
     const auto st = protocolEngineStatus();
-    QString remote = remote_->isConnected()
-        ? QString::fromStdString(remote_->currentPath())
+    RemoteFsModel* rm = currentRemote();
+    QString remote = (rm && rm->isConnected())
+        ? QString::fromStdString(rm->currentPath())
         : QString("-");
     statusLabel_->setText(QString("%1 | %2 行 | 远端: %3 | engines: ftp=%4 "
                                   "ssh=%5 zstd=%6 exec=%7")

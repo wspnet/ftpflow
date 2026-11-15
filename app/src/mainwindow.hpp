@@ -7,6 +7,10 @@
 
 #include <map>
 #include <memory>
+#include <vector>
+
+#include <QList>
+#include <QVector>
 
 #include "ftpflow/transfer_queue.hpp"
 #include "local_fs_model.hpp"
@@ -21,6 +25,7 @@ class QSortFilterProxyModel;
 class QLabel;
 class QPushButton;
 class QSpinBox;
+class QTabWidget;
 class QTimer;
 
 namespace ftpflow {
@@ -36,20 +41,9 @@ private slots:
     void onUp();
     void onActivated(const QModelIndex& idx);
     void onVerdictsReady();
-    void onConnect();
-    void onDisconnect();
-    void onRemoteUp();
-    void onRemoteRefresh();
-    void onRemoteActivated(const QModelIndex& idx);
-    void onRemoteConnected();
-    void onRemoteConnectFailed(const QString& msg);
-    void onRemoteBrowseFailed(const QString& msg);
-    void onRemoteOpFailed(const QString& msg);
-    void onRemoteContextMenu(const QPoint& pos);
-    void onConnectionLost(const QString& msg);
-    void onHostKeyUnknown(const QString& fingerprint, const QString& host,
-                          quint16 port, const QString& keyHex);
     void renameRemoteSelected();   // F2 inline rename of the current row
+    void onNewRemoteTab();
+    void onTabClosed(int index);
 
     // Transfer dock interactions.
     void onTransferContextMenu(const QPoint& pos);
@@ -59,9 +53,29 @@ private slots:
     void onClearAll();
 
 private:
+    // One remote session per tab (XTerminal-style multi-tab). Each tab owns
+    // its own RemoteFsModel + table + address bar + nav/connect buttons.
+    struct RemoteTab {
+        RemoteFsModel* model = nullptr;
+        QSortFilterProxyModel* proxy = nullptr;
+        QTableView* table = nullptr;
+        QLineEdit* pathEdit = nullptr;
+        QPushButton* connectBtn = nullptr;
+        QPushButton* disconnectBtn = nullptr;
+        QPushButton* upBtn = nullptr;
+        QPushButton* refreshBtn = nullptr;
+    };
+
     void buildUi();
     void showRoot(const std::string& root);
     void refreshStatusBar();
+
+    // Per-tab remote event handlers (called via tab-capturing lambdas so a
+    // background tab's events hit the right tab).
+    void onRemoteContextMenu(RemoteTab& tab, const QPoint& pos);
+    void onHostKeyUnknown(RemoteTab& tab, const QString& fingerprint,
+                          const QString& host, quint16 port,
+                          const QString& keyHex);
 
     // Drag & drop: panes accept the other's drops (local->remote = upload,
     // remote->local = download). Handled here rather than in the models so
@@ -83,12 +97,13 @@ private:
     QTableView* left_ = nullptr;
     QLineEdit* pathEdit_ = nullptr;
 
-    RemoteFsModel* remote_ = nullptr;
-    QSortFilterProxyModel* remoteProxy_ = nullptr;
-    QTableView* rightTable_ = nullptr;
-    QLineEdit* remotePathEdit_ = nullptr;
-    QPushButton* connectBtn_ = nullptr;
-    QPushButton* disconnectBtn_ = nullptr;
+    QTabWidget* remoteTabs_ = nullptr;
+    QList<RemoteTab*> tabs_;   // stable pointers; lambdas capture RemoteTab*
+    // Builds a new tab (UI + signal wiring) and returns it.
+    RemoteTab* addRemoteTab();
+    RemoteTab* currentTab();
+    const RemoteTab* currentTab() const;
+    RemoteFsModel* currentRemote() const;
 
     SiteStore siteStore_;
 
