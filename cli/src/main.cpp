@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ftpflow/compress_decide.hpp"
+#include "ftpflow/ftp_session.hpp"
 #include "ftpflow/protocol_status.hpp"
 #include "ftpflow/ssh_exec.hpp"
 #include "ftpflow/version.hpp"
@@ -221,6 +222,109 @@ int cmdSshExec(const std::vector<std::string>& args) {
 
 }  // namespace
 
+namespace {
+
+// ftp <ls|get|put|size> <host[:port]> [user] [password] ...
+//   The FTP/FTPS smoke surface over FtpSession. Password may be "-" to
+//   use the anonymous default.
+ftpflow::FtpOptions parseFtpEndpoint(const std::vector<std::string>& a,
+                                     std::size_t& i) {
+    ftpflow::FtpOptions opt;
+    opt.host = a[i++];
+    const std::size_t colon = opt.host.rfind(':');
+    if (colon != std::string::npos && colon + 1 < opt.host.size()) {
+        opt.port = static_cast<std::uint16_t>(std::atoi(opt.host.c_str() + colon + 1));
+        opt.host = opt.host.substr(0, colon);
+    }
+    if (i < a.size()) {
+        opt.user = a[i++];
+        if (i < a.size()) {
+            const std::string pw = a[i++];
+            opt.password = (pw == "-") ? std::string() : pw;
+        }
+    }
+    return opt;
+}
+
+int cmdFtp(const std::vector<std::string>& a) {
+    if (a.size() < 2) {
+        std::fprintf(stderr,
+            "usage: ftpcli ftp <cmd> <host[:port]> [user] [password] ...\n"
+            "  ls   <host> [user] [pass] [dir]        list a directory\n"
+            "  size <host> [user] [pass] <file>      remote file size\n"
+            "  get  <host> [user] [pass] <r> <l>     download (resume off)\n"
+            "  put  <host> [user] [pass] <l> <r>     upload\n"
+            "  password '-' = anonymous default\n");
+        return 2;
+    }
+    const std::string& cmd = a[0];
+    if (cmd != "ls" && cmd != "size" && cmd != "get" && cmd != "put") {
+        std::fprintf(stderr, "ftp: unknown subcommand %s\n", cmd.c_str());
+        return 2;
+    }
+    std::size_t i = 1;
+    ftpflow::FtpOptions opt = parseFtpEndpoint(a, i);
+
+    ftpflow::FtpSession ftp;
+    ftpflow::FtpResult r = ftp.open(opt);
+    if (!r.ok()) {
+        std::fprintf(stderr, "ftp open failed [%s]: %s\n",
+            ftpflow::ftpStatusName(r.status), r.message.c_str());
+        return 1;
+    }
+
+    if (cmd == "ls") {
+        std::string dir = i < a.size() ? a[i] : "/";
+        ftpflow::ListingPage page = ftp.list(dir);
+        if (page.entries.empty()) {
+            std::fprintf(stderr, "ftp ls: empty or failed (dir %s)\n", dir.c_str());
+            return 1;
+        }
+        std::printf("%-40s %12s %s\n", "NAME", "SIZE", "TYPE");
+        for (const auto& e : page.entries) {
+            const char* t = e.type == ftpflow::EntryType::Directory ? "dir"
+                          : e.type == ftpflow::EntryType::Symlink ? "link" : "file";
+            std::printf("%-40s %12llu %s\n", e.name.c_str(),
+                static_cast<unsigned long long>(e.size), t);
+        }
+        return 0;
+    }
+    if (cmd == "size") {
+        if (i >= a.size()) { std::fprintf(stderr, "size: need <file>\n"); return 2; }
+        std::uint64_t n = 0;
+        ftpflow::FtpResult sr = ftp.size(a[i], &n);
+        if (!sr.ok()) {
+            std::fprintf(stderr, "ftp size failed: %s\n", sr.message.c_str());
+            return 1;
+        }
+        std::printf("%llu\n", static_cast<unsigned long long>(n));
+        return 0;
+    }
+    if (cmd == "get") {
+        if (i + 1 >= a.size()) { std::fprintf(stderr, "get: need <remote> <local>\n"); return 2; }
+        std::uint64_t moved = 0;
+        ftpflow::FtpResult gr = ftp.download(a[i], a[i + 1], 0, &moved);
+        if (!gr.ok()) {
+            std::fprintf(stderr, "ftp get failed: %s\n", gr.message.c_str());
+            return 1;
+        }
+        std::printf("downloaded %llu bytes\n", static_cast<unsigned long long>(moved));
+        return 0;
+    }
+    // put
+    if (i + 1 >= a.size()) { std::fprintf(stderr, "put: need <local> <remote>\n"); return 2; }
+    std::uint64_t moved = 0;
+    ftpflow::FtpResult pr = ftp.upload(a[i], a[i + 1], 0, &moved);
+    if (!pr.ok()) {
+        std::fprintf(stderr, "ftp put failed: %s\n", pr.message.c_str());
+        return 1;
+    }
+    std::printf("uploaded %llu bytes\n", static_cast<unsigned long long>(moved));
+    return 0;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     if (args.empty() || args[0] == "--help" || args[0] == "-h") {
@@ -229,6 +333,7 @@ int main(int argc, char** argv) {
             "  ftpcli version\n"
             "  ftpcli decide [--bw MIBPS] <file...>   run the 5-stage funnel\n"
             "  ftpcli info <dir>                      directory listing smoke test\n"
+            "  ftpcli ftp ls|size|get|put <host> ...  FTP smoke surface\n"
             "  ftpcli ssh exec <host[:port]> <user> <password> <cmd...>\n",
             ftpflow::versionString());
         return args.empty() ? 2 : 0;
@@ -238,6 +343,7 @@ int main(int argc, char** argv) {
     if (cmd == "version") return cmdVersion();
     if (cmd == "decide") return cmdDecide(rest);
     if (cmd == "info") return cmdInfo(rest);
+    if (cmd == "ftp") return cmdFtp(rest);
     if (cmd == "ssh") {
         if (rest.empty() || rest[0] != "exec") {
             std::fprintf(stderr, "usage: ftpcli ssh exec <host> <user> <password> <cmd...>\n");
