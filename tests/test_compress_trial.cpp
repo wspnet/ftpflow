@@ -48,6 +48,9 @@ static void testTrial() {
     CHECK(t.sampleBytes == text.size());
     CHECK(t.ratio < 0.5);
     CHECK(t.measuredCompressBps > 0);
+#if FTPFLOW_HAVE_ZSTD
+    CHECK(t.engineIsZstd);   // zstd is the primary trial engine when built
+#endif
 
     // Random data: no gain, ratio pinned at 1.0.
     std::vector<std::uint8_t> rnd = makeRandom(64 * 1024);

@@ -26,6 +26,10 @@
 #endif
 #include <windows.h>
 
+#if FTPFLOW_HAVE_ZSTD
+#include <zstd.h>
+#endif
+
 namespace ftpflow {
 namespace {
 
@@ -144,14 +148,49 @@ std::string fmtPct(double frac) {
 
 }  // namespace
 
+#if FTPFLOW_HAVE_ZSTD
+// zstd level 1 over the bounded sample. One-shot ZSTD_compress with an
+// exactly-sized output buffer; zstd returns an error (not partial output)
+// when the input is incompressible, which we read as "no gain".
+TrialResult trialViaZstd(const std::uint8_t* data, std::size_t len) {
+    TrialResult r;
+    len = std::min(len, kTrialMaxBytes);
+
+    const std::size_t bound = ZSTD_compressBound(len);
+    std::vector<std::uint8_t> out(bound);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::size_t produced = ZSTD_compress(
+        out.data(), out.size(), data, len, /*level=*/1);
+    const double elapsed = secondsSince(t0);
+
+    r.ok = true;
+    r.engineIsZstd = true;
+    r.sampleBytes = len;
+    if (!ZSTD_isError(produced) && produced < len) {
+        r.compressedBytes = produced;
+        r.ratio = static_cast<double>(produced) /
+                  static_cast<double>(len);
+    } else {
+        // ZSTD_error_dstSize_tooSmall / srcSize_wrong / incompressible:
+        // treating the sample as unshrinkable keeps the funnel safe.
+        r.compressedBytes = len;
+        r.ratio = 1.0;
+    }
+    if (elapsed > 1e-9) {
+        r.measuredCompressBps = static_cast<double>(len) / elapsed;
+    }
+    return r;
+}
+#endif
+
 TrialResult trialCompress(const std::uint8_t* data, std::size_t len) {
     if (data == nullptr || len == 0) return {};
 #if FTPFLOW_HAVE_ZSTD
-    // Wired when the zstd dependency lands (M0 step 1): ZSTD_compressStream
-    // level 1 over the bounded sample, engineIsZstd = true. Until then the
-    // win32 path below is the engine, so the funnel is testable today.
-#endif
+    return trialViaZstd(data, len);
+#else
     return trialViaRtl(data, len);
+#endif
 }
 
 Decision decideByCostModel(std::uint64_t fileSizeBytes, double ratio,
