@@ -64,6 +64,7 @@ private:
         QPushButton* disconnectBtn = nullptr;
         QPushButton* upBtn = nullptr;
         QPushButton* refreshBtn = nullptr;
+        QPushButton* cmdBtn = nullptr;   // open the server-command panel
     };
 
     void buildUi();
@@ -76,6 +77,7 @@ private:
     void onHostKeyUnknown(RemoteTab& tab, const QString& fingerprint,
                           const QString& host, quint16 port,
                           const QString& keyHex);
+    void onRemoteCommand(RemoteTab& tab);   // open the server-command panel
 
     // Drag & drop: panes accept the other's drops (local->remote = upload,
     // remote->local = download). Handled here rather than in the models so

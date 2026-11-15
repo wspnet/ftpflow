@@ -27,6 +27,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include "command_dialog.hpp"
 #include "connect_dialog.hpp"
 #include "ftpflow/known_hosts.hpp"
 #include "ftpflow/protocol_status.hpp"
@@ -357,14 +358,18 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
     tab->disconnectBtn = new QPushButton("断开", remoteBar);
     tab->upBtn = new QPushButton("向上", remoteBar);
     tab->refreshBtn = new QPushButton("刷新", remoteBar);
+    tab->cmdBtn = new QPushButton("命令", remoteBar);
+    tab->cmdBtn->setToolTip("在服务器上执行 shell 命令（复用当前连接）");
     tab->disconnectBtn->setEnabled(false);
     tab->upBtn->setEnabled(false);
     tab->refreshBtn->setEnabled(false);
+    tab->cmdBtn->setEnabled(false);
     remoteBarLay->addWidget(tab->pathEdit, 1);
     remoteBarLay->addWidget(tab->connectBtn);
     remoteBarLay->addWidget(tab->disconnectBtn);
     remoteBarLay->addWidget(tab->upBtn);
     remoteBarLay->addWidget(tab->refreshBtn);
+    remoteBarLay->addWidget(tab->cmdBtn);
 
     // Model/proxy are children of MainWindow (not the page) so they survive
     // independently; onTabClosed() deletes them explicitly.
@@ -428,6 +433,9 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
     connect(tab->refreshBtn, &QPushButton::clicked, this, [this, tab] {
         tab->model->refresh();
     });
+    connect(tab->cmdBtn, &QPushButton::clicked, this, [this, tab] {
+        onRemoteCommand(*tab);
+    });
     connect(tab->table, &QTableView::doubleClicked, this, [this, tab](
             const QModelIndex& i) {
         if (!i.isValid() || !tab->model->isConnected()) return;
@@ -449,6 +457,8 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
         tab->disconnectBtn->setEnabled(true);
         tab->upBtn->setEnabled(true);
         tab->refreshBtn->setEnabled(true);
+        // Command execution only applies to SSH (FTP has no shell).
+        tab->cmdBtn->setEnabled(tab->model->connInfo().isSftp);
         tab->pathEdit->setReadOnly(false);
         tab->pathEdit->setText(QString::fromStdString(tab->model->currentPath()));
         refreshStatusBar();
@@ -482,6 +492,7 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
     connect(tab->model, &RemoteFsModel::disconnected, this, [this, tab] {
         tab->upBtn->setEnabled(false);
         tab->refreshBtn->setEnabled(false);
+        tab->cmdBtn->setEnabled(false);
         tab->pathEdit->setText("未连接");
     });
 
@@ -569,6 +580,20 @@ void MainWindow::onHostKeyUnknown(RemoteTab& tab, const QString& fingerprint,
         tab.connectBtn->setEnabled(false);
         tab.pathEdit->setText("连接中...");
     }
+}
+
+void MainWindow::onRemoteCommand(RemoteTab& tab) {
+    if (!tab.model->isConnected()) {
+        statusBar()->showMessage("请先连接远端", 4000);
+        return;
+    }
+    const auto ci = tab.model->connInfo();
+    if (!ci.isSftp) {
+        statusBar()->showMessage("命令执行仅支持 SSH/SFTP 连接", 4000);
+        return;
+    }
+    CommandDialog dlg(ci, this);
+    dlg.exec();
 }
 
 void MainWindow::onRemoteContextMenu(RemoteTab& tab, const QPoint& pos) {

@@ -16,6 +16,8 @@ qt_add_executable(ftpflow_app
     src/remote_fs_model.cpp
     src/connect_dialog.cpp
     src/site_store.cpp
+    src/command_dialog.cpp
+    src/remote_command.cpp
 )
 target_link_libraries(ftpflow_app PRIVATE
     ftpflow_core
