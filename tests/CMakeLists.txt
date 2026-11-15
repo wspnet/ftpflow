@@ -44,6 +44,10 @@ add_executable(test_known_hosts test_known_hosts.cpp)
 target_link_libraries(test_known_hosts PRIVATE ftpflow_core)
 target_compile_features(test_known_hosts PRIVATE cxx_std_17)
 
+add_executable(test_ftp_mlsd test_ftp_mlsd.cpp)
+target_link_libraries(test_ftp_mlsd PRIVATE ftpflow_core ws2_32)
+target_compile_features(test_ftp_mlsd PRIVATE cxx_std_17)
+
 # Benchmark tool (not a test): 100k-entry enumeration budget from the
 # blueprint. Run manually: bench_list.exe [dir] [--create N]
 add_executable(bench_list bench_list.cpp)
@@ -60,6 +64,7 @@ add_test(NAME ssh_transfer COMMAND test_ssh_transfer)
 add_test(NAME transfer_queue COMMAND test_transfer_queue)
 add_test(NAME tree_walk COMMAND test_tree_walk)
 add_test(NAME known_hosts COMMAND test_known_hosts)
+add_test(NAME ftp_mlsd COMMAND test_ftp_mlsd)
 
 # Convenience target: build + run all tests in one step.
 add_custom_target(run_tests
@@ -73,6 +78,7 @@ add_custom_target(run_tests
     COMMAND $<TARGET_FILE:test_transfer_queue>
     COMMAND $<TARGET_FILE:test_tree_walk>
     COMMAND $<TARGET_FILE:test_known_hosts>
-    DEPENDS test_compress_decide test_vfs_local test_compress_trial test_sha256 test_ftz1 test_dir_cache test_ssh_transfer test_transfer_queue test_tree_walk test_known_hosts
+    COMMAND $<TARGET_FILE:test_ftp_mlsd>
+    DEPENDS test_compress_decide test_vfs_local test_compress_trial test_sha256 test_ftz1 test_dir_cache test_ssh_transfer test_transfer_queue test_tree_walk test_known_hosts test_ftp_mlsd
     USES_TERMINAL
 )

@@ -56,6 +56,16 @@ struct FtpResult {
     bool ok() const { return status == FtpStatus::Ok; }
 };
 
+// ---- MLSD (RFC 3659) line parsing (exposed for unit testing) --------------
+
+// Parse one MLSD line "type=file;size=123;modify=YYYYMMDDHHMMSS[.fff]; name"
+// into `e`. Returns false when the line is not a well-formed MLSD entry.
+bool parseMlsdLine(const std::string& line, Entry& e);
+
+// Parse an RFC 3659 "modify" timestamp into seconds since epoch (UTC);
+// returns 0 on malformed input.
+std::int64_t parseMlsdTimestamp(const std::string& s);
+
 struct FtpOptions {
     std::string host;          // host or host:port (no scheme)
     std::uint16_t port = 21;
@@ -133,6 +143,9 @@ public:
 private:
     struct Impl;
     FtpResult quoteCommand(const std::string& cmd);
+    // MLSD (RFC 3659) listing attempt; returns false and leaves lastErr set
+    // when the server rejects MLSD so the caller falls back to LIST.
+    bool listViaMlsd(const std::string& dir, std::vector<Entry>& out);
     Impl* impl_ = nullptr;
     bool opened_ = false;
     FtpOptions opt_;

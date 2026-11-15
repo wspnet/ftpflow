@@ -188,12 +188,89 @@ std::string makeUrl(const FtpOptions& opt, const std::string& path,
 
 }  // namespace
 
+// ---- MLSD (RFC 3659) public parsing helpers --------------------------------
+
+// Days from civil date (Y/M/D) to days since epoch (Howard Hinnant's
+// days_from_civil), valid for the full int32 range around the epoch. MLSD
+// timestamps are UTC, so no local-time adjustment.
+namespace {
+std::int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);                 // [0, 399]
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;  // [0, 365]
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;     // [0, 146096]
+    return (std::int64_t)era * 146097 + (std::int64_t)doe - 719468;
+}
+}  // namespace
+
+std::int64_t parseMlsdTimestamp(const std::string& s) {
+    if (s.size() < 14) return 0;
+    auto d2 = [&](std::size_t i) { return (s[i] - '0') * 10 + (s[i + 1] - '0'); };
+    for (std::size_t i = 0; i < 14; ++i)
+        if (s[i] < '0' || s[i] > '9') return 0;
+    const int year = d2(0) * 100 + d2(2);
+    const int mon = d2(4);
+    const int day = d2(6);
+    const int hh = d2(8);
+    const int mm = d2(10);
+    const int ss = d2(12);
+    if (mon < 1 || mon > 12 || day < 1 || day > 31) return 0;
+    if (hh > 23 || mm > 59 || ss > 60) return 0;
+    const std::int64_t days = daysFromCivil(year, (unsigned)mon, (unsigned)day);
+    return days * 86400 + hh * 3600 + mm * 60 + ss;
+}
+
+bool parseMlsdLine(const std::string& line, Entry& e) {
+    // The separator is ";" + a space: MLSD facts are always ';'-joined and
+    // the name begins after the first "; " sequence. This distinguishes the
+    // fact delimiter from a name that contains ';'.
+    const std::size_t sep = line.find("; ");
+    if (sep == std::string::npos) return false;
+    const std::string facts = line.substr(0, sep);
+    const std::string name = trim(line.substr(sep + 2));
+    if (name.empty() || name == "." || name == "..") return false;
+
+    e = Entry{};
+    e.name = name;
+    // Walk the ';'-separated facts.
+    std::size_t i = 0;
+    while (i < facts.size()) {
+        std::size_t semi = facts.find(';', i);
+        const std::string fact = facts.substr(
+            i, semi == std::string::npos ? std::string::npos : semi - i);
+        const std::size_t eq = fact.find('=');
+        if (eq != std::string::npos) {
+            const std::string key = fact.substr(0, eq);
+            const std::string val = fact.substr(eq + 1);
+            if (key == "type") {
+                if (val == "file") e.type = EntryType::File;
+                else if (val == "dir") e.type = EntryType::Directory;
+                else if (val == "cdir" || val == "pdir") e.type = EntryType::Directory;
+                else if (val.find("link") != std::string::npos ||
+                         val == "OS.unix=symlink") e.type = EntryType::Symlink;
+                else e.type = EntryType::Other;
+            } else if (key == "size") {
+                e.size = std::strtoull(val.c_str(), nullptr, 10);
+            } else if (key == "modify") {
+                e.mtimeUnix = parseMlsdTimestamp(val);
+            } else if (key == "UNIX.mode") {
+                e.permissions = (std::uint32_t)std::strtoul(val.c_str(), nullptr, 8);
+            }
+        }
+        if (semi == std::string::npos) break;
+        i = semi + 1;
+    }
+    return true;
+}
+
 struct FtpSession::Impl {
     CURL* easy = nullptr;
     char errBuf[CURL_ERROR_SIZE] = {0};
     std::string lastErr;
     std::string listBuf;
     int lastCurlErr = CURLE_OK;   // most recent curl result code
+    bool mlsdOk = false;          // server accepted MLSD (probed on first list)
     XferCtx xfer;   // progress/control state shared with the XFERINFO hook
 };
 
@@ -281,7 +358,7 @@ FtpResult FtpSession::open(const FtpOptions& opt) {
 
 Capabilities FtpSession::capabilities() const {
     Capabilities c;
-    c.structuredListing = false;   // LIST text parse; MLSD lands later
+    c.structuredListing = impl_ && impl_->mlsdOk;  // MLSD probed on list
     c.utf8Paths = true;
     c.resume = true;               // REST / APPE
     c.chmod = true;                // SITE CHMOD (server dependent)
@@ -296,37 +373,92 @@ ListingPage FtpSession::list(const std::string& dir) {
     if (!opened_ || !impl_ || !impl_->easy)
         return page;  // caller checks isOpen()
 
-    std::string d = dir.empty() ? opt_.initialPath : dir;
-    impl_->listBuf.clear();
+    const std::string d = dir.empty() ? opt_.initialPath : dir;
+
+    // Prefer MLSD (RFC 3659): structured facts (size/type/mtime) instead of
+    // scraping LIST text. On a server that rejects MLSD, fall back to LIST.
+    if (listViaMlsd(d, page.entries)) {
+        impl_->mlsdOk = true;
+    } else {
+        // Fallback: classic LIST text parse.
+        impl_->lastErr.clear();
+        impl_->listBuf.clear();
+        ::curl_easy_setopt(impl_->easy, CURLOPT_URL,
+                           makeUrl(opt_, d, true).c_str());
+        ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEFUNCTION, appendToString);
+        ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEDATA, &impl_->listBuf);
+        // Default request for a trailing-slash URL is LIST; overriding via
+        // CUSTOMREQUEST breaks curl's internal FTP state machine.
+        ::curl_easy_setopt(impl_->easy, CURLOPT_DIRLISTONLY, 0L);
+        CURLcode rc = ::curl_easy_perform(impl_->easy);
+        if (rc != CURLE_OK) {
+            impl_->lastCurlErr = (int)rc;
+            impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
+            impl_->lastErr = *impl_->errBuf ? impl_->errBuf
+                                            : ::curl_easy_strerror(rc);
+            impl_->lastErr = "list: " + impl_->lastErr;
+            return page;  // caller sees an empty page; lastErr holds the cause
+        }
+        std::size_t pos = 0;
+        while (pos < impl_->listBuf.size()) {
+            std::size_t nl = impl_->listBuf.find('\n', pos);
+            std::string line = impl_->listBuf.substr(
+                pos, nl == std::string::npos ? std::string::npos : nl - pos);
+            pos = nl == std::string::npos ? impl_->listBuf.size() : nl + 1;
+            Entry e;
+            if (parseListLine(trim(line), e)) page.entries.push_back(e);
+        }
+    }
+    page.hasMore = false;  // whole listing in one page
+    return page;
+}
+
+bool FtpSession::listViaMlsd(const std::string& dir, std::vector<Entry>& out) {
     impl_->lastErr.clear();
-    ::curl_easy_setopt(impl_->easy, CURLOPT_URL, makeUrl(opt_, d, true).c_str());
+    impl_->listBuf.clear();
+    // MLSD over the data connection; curl issues the MLSD verb for a
+    // trailing-slash URL when CUSTOMREQUEST is set. DIRLISTONLY keeps curl
+    // from rewriting it into LIST.
+    ::curl_easy_setopt(impl_->easy, CURLOPT_URL,
+                       makeUrl(opt_, dir, true).c_str());
+    ::curl_easy_setopt(impl_->easy, CURLOPT_CUSTOMREQUEST, "MLSD");
+    ::curl_easy_setopt(impl_->easy, CURLOPT_DIRLISTONLY, 1L);
     ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEFUNCTION, appendToString);
     ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEDATA, &impl_->listBuf);
-    // Default request for a trailing-slash URL is LIST; overriding via
-    // CUSTOMREQUEST breaks curl's internal FTP state machine.
+    const CURLcode rc = ::curl_easy_perform(impl_->easy);
+    // Restore the default request verb for subsequent LIST/other calls.
+    ::curl_easy_setopt(impl_->easy, CURLOPT_CUSTOMREQUEST, nullptr);
     ::curl_easy_setopt(impl_->easy, CURLOPT_DIRLISTONLY, 0L);
-    CURLcode rc = ::curl_easy_perform(impl_->easy);
     if (rc != CURLE_OK) {
         impl_->lastCurlErr = (int)rc;
         impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
         impl_->lastErr = *impl_->errBuf ? impl_->errBuf
                                         : ::curl_easy_strerror(rc);
-        impl_->lastErr = "list: " + impl_->lastErr;
-        return page;  // caller sees an empty page; lastErr holds the cause
+        return false;
     }
-
-    // Split lines and parse.
+    // A server without MLSD answers 500/502 and curl surfaces it as a
+    // QUOTE/response error (non-CURLE_OK) above; if we got here the data
+    // connection delivered MLSD lines. Parse them.
     std::size_t pos = 0;
+    bool any = false;
     while (pos < impl_->listBuf.size()) {
         std::size_t nl = impl_->listBuf.find('\n', pos);
         std::string line = impl_->listBuf.substr(
             pos, nl == std::string::npos ? std::string::npos : nl - pos);
         pos = nl == std::string::npos ? impl_->listBuf.size() : nl + 1;
+        line = trim(line);
+        if (line.empty()) continue;
         Entry e;
-        if (parseListLine(trim(line), e)) page.entries.push_back(e);
+        if (parseMlsdLine(line, e)) {
+            out.push_back(std::move(e));
+            any = true;
+        }
     }
-    page.hasMore = false;  // whole listing in one page
-    return page;
+    // Even an empty directory yields well-formed MLSD (just zero entries);
+    // `any` guards against a server that echoed LIST text to MLSD.
+    (void)any;
+    impl_->lastErr.clear();
+    return true;
 }
 
 FtpResult FtpSession::size(const std::string& remotePath,
@@ -579,6 +711,10 @@ Capabilities FtpSession::capabilities() const {
 }
 
 ListingPage FtpSession::list(const std::string&) { return {}; }
+
+bool FtpSession::listViaMlsd(const std::string&, std::vector<Entry>&) {
+    return false;
+}
 
 FtpResult FtpSession::size(const std::string&, std::uint64_t*) {
     return {FtpStatus::EngineUnavailable, "built without libcurl"};
