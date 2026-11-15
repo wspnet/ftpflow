@@ -17,6 +17,7 @@
 #include "ftpflow/compress_decide.hpp"
 #include "ftpflow/ftp_session.hpp"
 #include "ftpflow/sftp_session.hpp"
+#include "ftpflow/transfer_queue.hpp"
 #include "ftpflow/protocol_status.hpp"
 #include "ftpflow/ssh_exec.hpp"
 #include "ftpflow/ssh_transfer.hpp"
@@ -590,6 +591,121 @@ int cmdSftp(const std::vector<std::string>& a) {
     return 2;
 }
 
+// queue <ftp|sftp|ssh> <host[:port]> <user> <pw|-> [--key K] [--workers N]
+//       [--level N] [--cmd T] [--store] <local> <remote> [<local> <remote>...]
+//   Enqueues transfers through the concurrent TransferQueue and prints the
+//   event stream. 'ssh' uploads auto-decide Compress vs Store through the
+//   5-stage funnel (--store forces SFTP store).
+int cmdQueue(const std::vector<std::string>& a) {
+    if (a.size() < 6) {
+        std::fprintf(stderr,
+            "usage: ftpcli queue <ftp|sftp|ssh> <host[:port]> <user> <pw|-> [--key K]\n"
+            "                     [--workers N] [--level N] [--cmd T] [--store]\n"
+            "                     <local> <remote> [<local> <remote> ...]\n");
+        return 2;
+    }
+    const std::string& proto = a[0];
+    if (proto != "ftp" && proto != "sftp" && proto != "ssh") {
+        std::fprintf(stderr, "queue: unknown protocol %s\n", proto.c_str());
+        return 2;
+    }
+    ftpflow::SshEndpoint ep;
+    ftpflow::FtpOptions fopt;
+    ep.host = fopt.host = a[1];
+    ep.user = fopt.user = a[2];
+    ep.password = fopt.password = a[3];
+    const std::size_t colon = ep.host.rfind(':');
+    if (colon != std::string::npos && colon + 1 < ep.host.size()) {
+        ep.port = fopt.port = static_cast<std::uint16_t>(
+            std::atoi(ep.host.c_str() + colon + 1));
+        ep.host = fopt.host = ep.host.substr(0, colon);
+    }
+    unsigned workers = 2;
+    int level = 3;
+    std::string cmdTemplate;
+    bool store = false;
+    std::vector<std::string> pos;
+    for (std::size_t i = 4; i < a.size(); ++i) {
+        if (a[i] == "--key" && i + 1 < a.size()) {
+            ep.privateKeyPem = readWholeFile(a[++i]);
+            if (ep.privateKeyPem.empty()) {
+                std::fprintf(stderr, "queue: cannot read key file %s\n", a[i].c_str());
+                return 2;
+            }
+        } else if (a[i] == "--workers" && i + 1 < a.size()) {
+            workers = (unsigned)std::atoi(a[++i].c_str());
+        } else if (a[i] == "--level" && i + 1 < a.size()) {
+            level = std::atoi(a[++i].c_str());
+        } else if (a[i] == "--cmd" && i + 1 < a.size()) {
+            cmdTemplate = a[++i];
+        } else if (a[i] == "--store") {
+            store = true;
+        } else {
+            pos.push_back(a[i]);
+        }
+    }
+    if (pos.size() < 2 || pos.size() % 2 != 0) {
+        std::fprintf(stderr, "queue: need an even number of <local> <remote> args\n");
+        return 2;
+    }
+
+    ftpflow::TransferQueue queue(workers);
+    queue.setEventCallback([](const ftpflow::TransferEvent& e) {
+        const char* kind = e.kind == ftpflow::TransferEvent::Kind::Started   ? "start"
+                          : e.kind == ftpflow::TransferEvent::Kind::Progress ? "prog "
+                                                                             : "done ";
+        const char* st = e.state == ftpflow::TransferState::Done    ? "done    "
+                        : e.state == ftpflow::TransferState::Failed  ? "failed  "
+                        : e.state == ftpflow::TransferState::Canceled ? "canceled"
+                                                                     : "running ";
+        const double pct = e.progress.bytesTotal > 0
+            ? 100.0 * (double)e.progress.bytesMoved / (double)e.progress.bytesTotal
+            : 0.0;
+        std::printf("[job %llu] %s %s mode=%s %.1f%% (%llu/%llu, wire %llu, ratio %.3f)%s%s\n",
+            (unsigned long long)e.jobId, kind, st,
+            e.mode == ftpflow::TransferMode::Compress ? "compress" : "store",
+            pct,
+            (unsigned long long)e.progress.bytesMoved,
+            (unsigned long long)e.progress.bytesTotal,
+            (unsigned long long)e.progress.bytesOnWire,
+            e.progress.compressionRatio,
+            e.error.empty() ? "" : " err=",
+            e.error.c_str());
+        if (e.kind == ftpflow::TransferEvent::Kind::Started &&
+            e.decision.stage > 0) {
+            std::printf("[job %llu]       decision: stage %d, %s\n",
+                (unsigned long long)e.jobId, e.decision.stage,
+                e.decision.reason.c_str());
+        }
+        std::fflush(stdout);
+    });
+
+    for (std::size_t i = 0; i + 1 < pos.size(); i += 2) {
+        const std::string& local = pos[i];
+        const std::string& remote = pos[i + 1];
+        ftpflow::TransferRequest req;
+        req.direction = ftpflow::TransferDirection::Upload;
+        req.protocol = proto == "ftp" ? ftpflow::BackendKind::Ftp
+                                       : ftpflow::BackendKind::Sftp;
+        req.localPath = local;
+        req.remotePath = remote;
+        req.ftp = fopt;
+        req.ssh = ep;
+        req.zstdLevel = level;
+        req.pushCommandTemplate = cmdTemplate;
+        if (store) {
+            req.autoDecide = false;
+            req.mode = ftpflow::TransferMode::Store;
+        }
+        const std::uint64_t id = queue.enqueue(std::move(req));
+        std::printf("[queue] enqueued job %llu: %s -> %s\n",
+            (unsigned long long)id, local.c_str(), remote.c_str());
+    }
+    queue.waitAll();
+    std::printf("[queue] drained\n");
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -616,6 +732,7 @@ int main(int argc, char** argv) {
     if (cmd == "info") return cmdInfo(rest);
     if (cmd == "ftp") return cmdFtp(rest);
     if (cmd == "sftp") return cmdSftp(rest);
+    if (cmd == "queue") return cmdQueue(rest);
     if (cmd == "zdecode") return cmdZdecode(rest);
     if (cmd == "ssh") {
         if (rest.empty() || (rest[0] != "exec" && rest[0] != "push")) {

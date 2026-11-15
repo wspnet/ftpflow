@@ -6,12 +6,15 @@
 #include "ftpflow/sftp_session.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #if defined(FTPFLOW_HAVE_LIBSSH2)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <sys/stat.h>
 #include <libssh2.h>
 #include <libssh2_sftp.h>
 #else
@@ -26,6 +29,9 @@ struct SftpSession::Impl {
     LIBSSH2_SESSION* session = nullptr;
     LIBSSH2_SFTP* sftp = nullptr;
     SOCKET sock = INVALID_SOCKET;
+
+    std::function<void(std::uint64_t, std::uint64_t)> onProgress;
+    std::uint64_t progressTotal = 0;   // set per transfer by the caller side
 
     static std::string hexOf(const unsigned char* p, std::size_t n) {
         static const char* kHex = "0123456789abcdef";
@@ -85,6 +91,16 @@ SftpStatus classifySftpErr(LIBSSH2_SFTP* sftp) {
     if (proto == LIBSSH2_FX_PERMISSION_DENIED)
         return SftpStatus::AuthFailed;
     return SftpStatus::IoError;
+}
+
+// Control poll point shared by download/upload: parks while paused, tells
+// the caller to abort on cancel.
+bool ctlParkOrAbort(const TransferControl* ctl) {
+    if (!ctl) return false;
+    while (ctl->pause && !ctl->cancel) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return ctl->cancel;
 }
 
 }  // namespace
@@ -302,7 +318,7 @@ SftpResult SftpSession::download(const std::string& remotePath,
                                  const std::string& localPath,
                                  std::uint64_t resumeBytes,
                                  std::uint64_t* bytesMoved,
-                                 const volatile bool* cancel) {
+                                 const TransferControl* ctl) {
     if (bytesMoved) *bytesMoved = 0;
     if (state_ != State::Open || !impl_->sftp) {
         return {SftpStatus::IoError, "session not open"};
@@ -320,6 +336,14 @@ SftpResult SftpSession::download(const std::string& remotePath,
                          impl_->session);
     }
 
+    impl_->progressTotal = resumeBytes;
+    {   // total = remote size (best effort; 0 = unknown)
+        LIBSSH2_SFTP_ATTRIBUTES st{};
+        if (libssh2_sftp_fstat(h, &st) == 0 && (st.flags & LIBSSH2_SFTP_ATTR_SIZE)) {
+            impl_->progressTotal = st.filesize;
+        }
+    }
+
     const char* mode = resumeBytes > 0 ? "ab" : "wb";
     std::FILE* f = std::fopen(localPath.c_str(), mode);
     if (!f) {
@@ -332,8 +356,9 @@ SftpResult SftpSession::download(const std::string& remotePath,
 
     std::vector<char> buf(64 * 1024);
     SftpResult result;
+    std::uint64_t moved = 0;
     for (;;) {
-        if (cancel && *cancel) {
+        if (ctlParkOrAbort(ctl)) {
             result = {SftpStatus::Canceled, "canceled by caller"};
             break;
         }
@@ -357,7 +382,9 @@ SftpResult SftpSession::download(const std::string& remotePath,
             result = {SftpStatus::IoError, "local write failed: " + localPath};
             break;
         }
-        if (bytesMoved) *bytesMoved += (std::uint64_t)n;
+        moved += (std::uint64_t)n;
+        if (bytesMoved) *bytesMoved = moved;
+        if (impl_->onProgress) impl_->onProgress(moved, impl_->progressTotal);
     }
 
     if (std::fclose(f) != 0 && result.ok()) {
@@ -371,7 +398,7 @@ SftpResult SftpSession::upload(const std::string& localPath,
                                const std::string& remotePath,
                                std::uint64_t resumeBytes,
                                std::uint64_t* bytesMoved,
-                               const volatile bool* cancel) {
+                               const TransferControl* ctl) {
     if (bytesMoved) *bytesMoved = 0;
     if (state_ != State::Open || !impl_->sftp) {
         return {SftpStatus::IoError, "session not open"};
@@ -379,6 +406,13 @@ SftpResult SftpSession::upload(const std::string& localPath,
 
     std::FILE* f = std::fopen(localPath.c_str(), "rb");
     if (!f) return {SftpStatus::IoError, "cannot open local " + localPath};
+    impl_->progressTotal = resumeBytes;
+    {
+        struct _stat64 st{};
+        if (_stat64(localPath.c_str(), &st) == 0) {
+            impl_->progressTotal = (std::uint64_t)st.st_size;
+        }
+    }
 
     const long openFlags = resumeBytes > 0
         ? (LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT)
@@ -408,8 +442,9 @@ SftpResult SftpSession::upload(const std::string& localPath,
 
     std::vector<char> buf(64 * 1024);
     SftpResult result;
+    std::uint64_t moved = 0;
     for (;;) {
-        if (cancel && *cancel) {
+        if (ctlParkOrAbort(ctl)) {
             result = {SftpStatus::Canceled, "canceled by caller"};
             break;
         }
@@ -421,6 +456,7 @@ SftpResult SftpSession::upload(const std::string& localPath,
             break;   // EOF (or error, reported above)
         }
         std::size_t off = 0;
+        bool aborted = false;
         while (off < got) {
             ssize_t n = 0;
             while ((n = libssh2_sftp_write(h, buf.data() + off,
@@ -437,17 +473,26 @@ SftpResult SftpSession::upload(const std::string& localPath,
                                        ("write " + remotePath).c_str(),
                                        impl_->session);
                 }
+                aborted = true;
                 break;
             }
             off += (std::size_t)n;
-            if (bytesMoved) *bytesMoved += (std::uint64_t)n;
+            moved += (std::uint64_t)n;
+            if (bytesMoved) *bytesMoved = moved;
         }
-        if (!result.ok()) break;
+        if (aborted || !result.ok()) break;
+        if (impl_->onProgress) impl_->onProgress(moved, impl_->progressTotal);
     }
 
     std::fclose(f);
     libssh2_sftp_close(h);
     return result;
+}
+
+void SftpSession::setProgressCallback(
+        std::function<void(std::uint64_t, std::uint64_t)> fn) {
+    if (impl_ == nullptr) impl_ = new Impl();
+    impl_->onProgress = std::move(fn);
 }
 
 SftpResult SftpSession::mkdir(const std::string& remotePath, std::uint32_t mode) {
@@ -578,13 +623,15 @@ SftpResult SftpSession::size(const std::string&, std::uint64_t*) {
     return {SftpStatus::EngineUnavailable, "built without libssh2"};
 }
 SftpResult SftpSession::download(const std::string&, const std::string&,
-                                 std::uint64_t, std::uint64_t*, const volatile bool*) {
+                                 std::uint64_t, std::uint64_t*, const TransferControl*) {
     return {SftpStatus::EngineUnavailable, "built without libssh2"};
 }
 SftpResult SftpSession::upload(const std::string&, const std::string&,
-                               std::uint64_t, std::uint64_t*, const volatile bool*) {
+                               std::uint64_t, std::uint64_t*, const TransferControl*) {
     return {SftpStatus::EngineUnavailable, "built without libssh2"};
 }
+void SftpSession::setProgressCallback(
+        std::function<void(std::uint64_t, std::uint64_t)>) {}
 SftpResult SftpSession::mkdir(const std::string&, std::uint32_t) {
     return {SftpStatus::EngineUnavailable, "built without libssh2"};
 }

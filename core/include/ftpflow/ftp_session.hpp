@@ -11,9 +11,11 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
+#include "ftpflow/transfer.hpp"
 #include "ftpflow/vfs.hpp"
 
 namespace ftpflow {
@@ -28,6 +30,7 @@ enum class FtpStatus : std::uint8_t {
     DownloadFailed,
     UploadFailed,
     IoError,
+    Canceled,    // caller flipped the TransferControl cancel flag
 };
 
 inline const char* ftpStatusName(FtpStatus s) {
@@ -41,6 +44,7 @@ inline const char* ftpStatusName(FtpStatus s) {
         case FtpStatus::DownloadFailed: return "download-failed";
         case FtpStatus::UploadFailed: return "upload-failed";
         case FtpStatus::IoError: return "io-error";
+        case FtpStatus::Canceled: return "canceled";
     }
     return "?";
 }
@@ -84,17 +88,25 @@ public:
 
     // Downloads remote -> local. `resumeBytes` continues an interrupted
     // transfer (FTP REST) by appending to the local file from that offset.
+    // `ctl` is polled inside libcurl's progress hook (pause parks, cancel
+    // aborts -> FtpStatus::Canceled).
     FtpResult download(const std::string& remotePath,
                        const std::string& localPath,
                        std::uint64_t resumeBytes = 0,
-                       std::uint64_t* bytesMoved = nullptr);
+                       std::uint64_t* bytesMoved = nullptr,
+                       const TransferControl* ctl = nullptr);
 
     // Uploads local -> remote (STOR). `resumeBytes` uses APPE-style
     // continuation via CURLOPT_APPEND.
     FtpResult upload(const std::string& localPath,
                      const std::string& remotePath,
                      std::uint64_t resumeBytes = 0,
-                     std::uint64_t* bytesMoved = nullptr);
+                     std::uint64_t* bytesMoved = nullptr,
+                     const TransferControl* ctl = nullptr);
+
+    // (moved, total) via libcurl's progress hook, roughly per network
+    // chunk. Throttle downstream.
+    void setProgressCallback(std::function<void(std::uint64_t, std::uint64_t)> fn);
 
     bool isOpen() const { return opened_; }
     void close();

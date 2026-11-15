@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "ftpflow/ssh_exec.hpp"   // SshEndpoint, SshStatus, HostKeyPolicy
+#include "ftpflow/transfer.hpp"  // TransferControl
 #include "ftpflow/vfs.hpp"
 
 namespace ftpflow {
@@ -89,13 +90,14 @@ public:
     SftpResult size(const std::string& remotePath, std::uint64_t* out);
 
     // Downloads remote -> local in 64 KiB chunks. `resumeBytes` seeks the
-    // remote handle and appends to the local file. `cancel` is polled
-    // between chunks (set it from another thread to abort).
+    // remote handle and appends to the local file. `ctl` is polled between
+    // chunks (pause parks, cancel aborts -> SftpStatus::Canceled). `moved`
+    // in the progress callback counts from zero (resume bytes excluded).
     SftpResult download(const std::string& remotePath,
                         const std::string& localPath,
                         std::uint64_t resumeBytes = 0,
                         std::uint64_t* bytesMoved = nullptr,
-                        const volatile bool* cancel = nullptr);
+                        const TransferControl* ctl = nullptr);
 
     // Uploads local -> remote. `resumeBytes` opens without truncation and
     // seeks the remote handle to that offset.
@@ -103,7 +105,11 @@ public:
                       const std::string& remotePath,
                       std::uint64_t resumeBytes = 0,
                       std::uint64_t* bytesMoved = nullptr,
-                      const volatile bool* cancel = nullptr);
+                      const TransferControl* ctl = nullptr);
+
+    // (moved, total) after each 64 KiB chunk. Throttle downstream: this
+    // fires per chunk.
+    void setProgressCallback(std::function<void(std::uint64_t, std::uint64_t)> fn);
 
     SftpResult mkdir(const std::string& remotePath, std::uint32_t mode = 0755);
     SftpResult removeFile(const std::string& remotePath);
@@ -114,8 +120,7 @@ public:
     bool isOpen() const { return state_ == State::Open; }
     void close();
 
-private:
-    struct Impl;
+private:    struct Impl;
     enum class State : std::uint8_t { Idle, Open, Closed };
     Impl* impl_ = nullptr;
     State state_ = State::Idle;

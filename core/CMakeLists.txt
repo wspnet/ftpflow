@@ -22,6 +22,7 @@ target_sources(ftpflow_core PRIVATE
     src/ssh_exec.cpp
     src/sftp_session.cpp
     src/ssh_transfer.cpp
+    src/transfer_queue.cpp
     src/ftp_session.cpp
     src/ftz1.cpp
     src/dir_cache.cpp

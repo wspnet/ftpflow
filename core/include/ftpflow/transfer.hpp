@@ -29,4 +29,13 @@ struct TransferProgress {
 
 using ProgressCallback = std::function<void(const TransferProgress&)>;
 
+// Shared mid-transfer control block. The queue (or any caller) flips these
+// from another thread; every backend polls between chunks:
+//   pause  -> the transfer parks (no data moves, connection stays alive)
+//   cancel -> aborts as soon as practical; the result reports Canceled
+struct TransferControl {
+    volatile bool pause = false;
+    volatile bool cancel = false;
+};
+
 }  // namespace ftpflow

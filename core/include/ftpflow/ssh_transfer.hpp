@@ -15,9 +15,11 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include "ftpflow/ssh_exec.hpp"
+#include "ftpflow/transfer.hpp"
 
 namespace ftpflow {
 
@@ -47,6 +49,11 @@ struct SshPushOptions {
     int zstdLevel = 3;
     int chunkKiB = 256;           // local read + compressed flush size
     int remoteTimeoutMs = 60000;  // overall wait for the remote to exit
+    // Polled between chunks (from another thread, e.g. the queue).
+    const TransferControl* control = nullptr;
+    // Called after each chunk with cumulative stats. Throttle downstream:
+    // this fires per 256 KiB.
+    std::function<void(const SshPushStats&)> onProgress;
 };
 
 SshResult sshPushFile(SshExec& ssh, const std::string& localPath,

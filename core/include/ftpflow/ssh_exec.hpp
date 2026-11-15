@@ -28,6 +28,7 @@ enum class SshStatus : std::uint8_t {
     ChannelFailed,
     IoError,
     Closed,
+    Canceled,   // caller flipped the TransferControl cancel flag
 };
 
 struct SshResult {
@@ -67,6 +68,7 @@ inline const char* sshStatusName(SshStatus s) {
         case SshStatus::ChannelFailed: return "channel-failed";
         case SshStatus::IoError: return "io-error";
         case SshStatus::Closed: return "closed";
+        case SshStatus::Canceled: return "canceled";
     }
     return "?";
 }

@@ -1,7 +1,9 @@
 // ftpflow -- SSH compressed transfer pipeline implementation.
 #include "ftpflow/ssh_transfer.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 #if defined(FTPFLOW_HAVE_ZSTD)
@@ -68,7 +70,15 @@ SshResult sshPushFile(SshExec& ssh, const std::string& localPath,
     // Compress + ship the file in chunks; pump after each chunk so remote
     // stderr surfaces early and the channel never starves the read side.
     bool channelDied = false;
+    bool canceled = false;
     for (;;) {
+        // Control poll point: park while paused, abort on cancel.
+        if (opts.control) {
+            while (opts.control->pause && !opts.control->cancel) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (opts.control->cancel) { canceled = true; break; }
+        }
         const std::size_t got = std::fread(in.data(), 1, in.size(), f);
         if (got == 0) break;
         st.localBytes += got;
@@ -90,6 +100,13 @@ SshResult sshPushFile(SshExec& ssh, const std::string& localPath,
         if (channelDied) break;
         ssh.pump(0);   // non-blocking drain (EAGAIN-safe)
         if (!ssh.isOpen()) { channelDied = true; break; }
+        if (opts.onProgress) opts.onProgress(st);
+    }
+    if (canceled) {
+        ZSTD_freeCStream(cs);
+        std::fclose(f);
+        ssh.close();
+        return {SshStatus::Canceled, "canceled by caller"};
     }
     if (std::ferror(f)) {
         return fail(SshStatus::IoError, "local read error: " + localPath);

@@ -1,9 +1,11 @@
 // ftpflow -- FTP/FTPS session implementation (libcurl, Schannel).
 #include "ftpflow/ftp_session.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 #if defined(FTPFLOW_HAVE_CURL)
 #include <curl/curl.h>
@@ -138,6 +140,38 @@ bool wantVerbose() {
     return v && *v && *v != '0';
 }
 
+// Progress/control context handed to libcurl's XFERINFO hook. A plain
+// file-local struct (not FtpSession::Impl, which is private) so the
+// callback in this namespace can touch it.
+struct XferCtx {
+    std::function<void(std::uint64_t, std::uint64_t)> onProgress;
+    const TransferControl* ctl = nullptr;   // set per transfer call
+    volatile bool isUpload = false;
+};
+
+// libcurl progress hook: parks while paused, returns nonzero to abort on
+// cancel (curl maps that to CURLE_ABORTED_BY_CALLBACK). NOTE: the client
+// pointer is the FIRST argument (curl_xferinfo_callback layout).
+int xferInfo(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
+             curl_off_t ultotal, curl_off_t ulnow) {
+    auto* ctx = static_cast<XferCtx*>(clientp);
+    if (ctx && ctx->ctl) {
+        while (ctx->ctl->pause && !ctx->ctl->cancel) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (ctx->ctl->cancel) return 1;
+    }
+    if (ctx && ctx->onProgress) {
+        const bool up = ctx->isUpload;
+        const std::uint64_t total = up ? (std::uint64_t)ultotal
+                                       : (std::uint64_t)dltotal;
+        const std::uint64_t now = up ? (std::uint64_t)ulnow
+                                     : (std::uint64_t)dlnow;
+        ctx->onProgress(now, total);
+    }
+    return 0;
+}
+
 // Builds "scheme://host[:port] + normalized path". The path always gets a
 // leading '/'; `trailingSlash` appends one for directory listings.
 std::string makeUrl(const FtpOptions& opt, const std::string& path,
@@ -159,6 +193,7 @@ struct FtpSession::Impl {
     char errBuf[CURL_ERROR_SIZE] = {0};
     std::string lastErr;
     std::string listBuf;
+    XferCtx xfer;   // progress/control state shared with the XFERINFO hook
 };
 
 FtpSession::FtpSession() {
@@ -189,6 +224,10 @@ FtpResult FtpSession::open(const FtpOptions& opt) {
     impl_->easy = ::curl_easy_init();
     if (!impl_->easy) return {FtpStatus::IoError, "curl_easy_init failed"};
     ::curl_easy_setopt(impl_->easy, CURLOPT_ERRORBUFFER, impl_->errBuf);
+    // Progress + control hook (needed for pause/cancel and progress events).
+    ::curl_easy_setopt(impl_->easy, CURLOPT_NOPROGRESS, 0L);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_XFERINFOFUNCTION, xferInfo);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_XFERINFODATA, &impl_->xfer);
     if (wantVerbose()) {
         ::curl_easy_setopt(impl_->easy, CURLOPT_VERBOSE, 1L);
         ::curl_easy_setopt(impl_->easy, CURLOPT_DEBUGFUNCTION, traceDump);
@@ -314,7 +353,8 @@ FtpResult FtpSession::size(const std::string& remotePath,
 FtpResult FtpSession::download(const std::string& remotePath,
                                const std::string& localPath,
                                std::uint64_t resumeBytes,
-                               std::uint64_t* bytesMoved) {
+                               std::uint64_t* bytesMoved,
+                               const TransferControl* ctl) {
     if (bytesMoved) *bytesMoved = 0;
     if (!opened_ || !impl_ || !impl_->easy)
         return {FtpStatus::IoError, "session not open"};
@@ -323,6 +363,8 @@ FtpResult FtpSession::download(const std::string& remotePath,
     std::FILE* f = std::fopen(localPath.c_str(), mode);
     if (!f) return {FtpStatus::IoError, "cannot open local " + localPath};
 
+    impl_->xfer.ctl = ctl;
+    impl_->xfer.isUpload = false;
     ::curl_easy_setopt(impl_->easy, CURLOPT_URL, makeUrl(opt_, remotePath, false).c_str());
     ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEFUNCTION, writeToFile);
     ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEDATA, f);
@@ -331,6 +373,13 @@ FtpResult FtpSession::download(const std::string& remotePath,
                            static_cast<curl_off_t>(resumeBytes));
     CURLcode rc = ::curl_easy_perform(impl_->easy);
     std::fclose(f);
+    impl_->xfer.ctl = nullptr;
+    if (rc == CURLE_ABORTED_BY_CALLBACK) {
+        if (resumeBytes > 0)
+            ::curl_easy_setopt(impl_->easy, CURLOPT_RESUME_FROM_LARGE,
+                               static_cast<curl_off_t>(0));
+        return {FtpStatus::Canceled, "canceled by caller", rc};
+    }
     if (rc != CURLE_PARTIAL_FILE && rc != CURLE_OK) {
         return {FtpStatus::DownloadFailed,
                 std::string("download: ") + ::curl_easy_strerror(rc), rc};
@@ -350,7 +399,8 @@ FtpResult FtpSession::download(const std::string& remotePath,
 FtpResult FtpSession::upload(const std::string& localPath,
                              const std::string& remotePath,
                              std::uint64_t resumeBytes,
-                             std::uint64_t* bytesMoved) {
+                             std::uint64_t* bytesMoved,
+                             const TransferControl* ctl) {
     if (bytesMoved) *bytesMoved = 0;
     if (!opened_ || !impl_ || !impl_->easy)
         return {FtpStatus::IoError, "session not open"};
@@ -361,6 +411,8 @@ FtpResult FtpSession::upload(const std::string& localPath,
     const std::uint64_t fsize = static_cast<std::uint64_t>(std::ftell(f));
     std::fseek(f, static_cast<long>(resumeBytes), SEEK_SET);
 
+    impl_->xfer.ctl = ctl;
+    impl_->xfer.isUpload = true;
     ::curl_easy_setopt(impl_->easy, CURLOPT_URL, makeUrl(opt_, remotePath, false).c_str());
     ::curl_easy_setopt(impl_->easy, CURLOPT_UPLOAD, 1L);
     ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEFUNCTION, discardData);
@@ -374,9 +426,13 @@ FtpResult FtpSession::upload(const std::string& localPath,
 
     CURLcode rc = ::curl_easy_perform(impl_->easy);
     std::fclose(f);
+    impl_->xfer.ctl = nullptr;
     ::curl_easy_setopt(impl_->easy, CURLOPT_UPLOAD, 0L);
     if (resumeBytes > 0)
         ::curl_easy_setopt(impl_->easy, CURLOPT_APPEND, 0L);
+    if (rc == CURLE_ABORTED_BY_CALLBACK) {
+        return {FtpStatus::Canceled, "canceled by caller", rc};
+    }
     if (rc != CURLE_PARTIAL_FILE && rc != CURLE_OK) {
         return {FtpStatus::UploadFailed,
                 std::string("upload: ") + ::curl_easy_strerror(rc), rc};
@@ -384,6 +440,11 @@ FtpResult FtpSession::upload(const std::string& localPath,
     if (bytesMoved)
         *bytesMoved = resumeBytes > 0 ? (fsize - resumeBytes) : fsize;
     return {};
+}
+
+void FtpSession::setProgressCallback(
+        std::function<void(std::uint64_t, std::uint64_t)> fn) {
+    if (impl_) impl_->xfer.onProgress = std::move(fn);
 }
 
 #else  // !FTPFLOW_HAVE_CURL
@@ -411,14 +472,19 @@ FtpResult FtpSession::size(const std::string&, std::uint64_t*) {
 }
 
 FtpResult FtpSession::download(const std::string&, const std::string&,
-                               std::uint64_t, std::uint64_t*) {
+                               std::uint64_t, std::uint64_t*,
+                               const TransferControl*) {
     return {FtpStatus::EngineUnavailable, "built without libcurl"};
 }
 
 FtpResult FtpSession::upload(const std::string&, const std::string&,
-                             std::uint64_t, std::uint64_t*) {
+                             std::uint64_t, std::uint64_t*,
+                             const TransferControl*) {
     return {FtpStatus::EngineUnavailable, "built without libcurl"};
 }
+
+void FtpSession::setProgressCallback(
+        std::function<void(std::uint64_t, std::uint64_t)>) {}
 
 #endif
 
