@@ -128,6 +128,14 @@ def main() -> int:
 
     preset = "release-full" if args.full else ("debug" if args.debug else "release")
 
+    if args.full:
+        vcpkg_root = ROOT.parent.parent / "vcpkg"
+        if not (vcpkg_root / "vcpkg.exe").exists():
+            die(f"--full needs vcpkg at {vcpkg_root} "
+                "(git clone + bootstrap-vcpkg.bat), or set VCPKG_ROOT.")
+        env["VCPKG_ROOT"] = str(vcpkg_root)
+        env["VCPKG_DEFAULT_TRIPLET"] = "x64-windows-static"
+
     build_dir = ROOT / "build" / preset
     if args.clean and build_dir.exists():
         shutil.rmtree(build_dir)

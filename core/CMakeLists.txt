@@ -36,9 +36,9 @@ if(FTPFLOW_WITH_LIBSSH2)
 endif()
 
 if(FTPFLOW_WITH_ZSTD)
-    # L4 trial-compression stage; wired in M0 Spike step 2.
-    find_package(ZSTD CONFIG REQUIRED)
-    target_link_libraries(ftpflow_core PRIVATE ZSTD::libzstd_shared)
+    # vcpkg zstd port exports zstd::libzstd (usage file).
+    find_package(zstd CONFIG REQUIRED)
+    target_link_libraries(ftpflow_core PRIVATE zstd::libzstd)
     target_compile_definitions(ftpflow_core PRIVATE FTPFLOW_HAVE_ZSTD=1)
 endif()
 

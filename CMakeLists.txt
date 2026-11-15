@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.21)
 
+# vcpkg manifest toolchain must be set BEFORE project(). Enabled through
+# build_native.py --full, which exports VCPKG_ROOT.
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        CACHE STRING "vcpkg toolchain")
+endif()
+
 project(ftpflow
     VERSION 0.1.0
     DESCRIPTION "FTP/SSH file transfer workbench with transparent SSH-side compression"
@@ -36,14 +43,6 @@ option(FTPFLOW_BUILD_TESTS  "Build unit tests"             ON)
 option(FTPFLOW_WITH_CURL    "Enable FTP/FTPS backend (libcurl)"      OFF)
 option(FTPFLOW_WITH_LIBSSH2 "Enable SFTP/SSH backend (libssh2)"      OFF)
 option(FTPFLOW_WITH_ZSTD    "Enable zstd compression pipeline"       OFF)
-
-if(FTPFLOW_WITH_CURL OR FTPFLOW_WITH_LIBSSH2 OR FTPFLOW_WITH_ZSTD)
-    # vcpkg manifest mode: set the toolchain before first project() use.
-    if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
-        set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
-            CACHE STRING "vcpkg toolchain")
-    endif()
-endif()
 
 add_subdirectory(core)
 
