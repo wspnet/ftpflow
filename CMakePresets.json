@@ -1,0 +1,53 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release (skeleton, no protocol deps)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "FTPFLOW_WITH_CURL": "OFF",
+        "FTPFLOW_WITH_LIBSSH2": "OFF",
+        "FTPFLOW_WITH_ZSTD": "OFF"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug (skeleton, no protocol deps)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "FTPFLOW_WITH_CURL": "OFF",
+        "FTPFLOW_WITH_LIBSSH2": "OFF",
+        "FTPFLOW_WITH_ZSTD": "OFF"
+      }
+    },
+    {
+      "name": "release-full",
+      "inherits": "base",
+      "displayName": "Release with protocol backends (needs vcpkg)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "FTPFLOW_WITH_CURL": "ON",
+        "FTPFLOW_WITH_LIBSSH2": "ON",
+        "FTPFLOW_WITH_ZSTD": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release-full", "configurePreset": "release-full" }
+  ]
+}

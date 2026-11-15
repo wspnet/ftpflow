@@ -1,0 +1,32 @@
+# Build output
+build/
+out/
+dist/
+packages/
+
+# Visual Studio / CMake
+.vs/
+.vscode/
+CMakeUserPresets.json
+*.user
+*.suo
+*.sdf
+*.opensdf
+VC.db
+
+# vcpkg
+vcpkg_installed/
+
+# Compile commands / logs
+compile_commands.json
+*.log
+
+# Qt artifacts
+moc_*.cpp
+qrc_*.cpp
+*.qmlc
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store

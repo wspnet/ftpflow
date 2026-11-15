@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "ftpflow",
+  "version": "0.1.0",
+  "dependencies": [
+    { "name": "libcurl", "default-features": false, "features": [ "schannel", "multi" ] },
+    { "name": "libssh2", "default-features": false, "features": [ "wincng" ] },
+    { "name": "zstd" }
+  ],
+  "builtin-baseline": "",
+  "overrides": [],
+  "notes": [
+    "Used by the 'release-full' CMake preset. The skeleton 'release' preset",
+    "builds with zero third-party dependencies. Pin 'builtin-baseline' to a",
+    "vcpkg commit hash before first real use (see README M0 checklist)."
+  ]
+}
