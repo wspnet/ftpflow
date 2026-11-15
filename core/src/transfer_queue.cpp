@@ -252,6 +252,14 @@ bool TransferQueue::resume(std::uint64_t jobId) {
     return false;
 }
 
+bool TransferQueue::isPaused(std::uint64_t jobId) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& j : all_) {
+        if (j->id == jobId) return j->ctl.pause;
+    }
+    return false;
+}
+
 void TransferQueue::waitAll() {
     std::unique_lock<std::mutex> lk(mu_);
     cvIdle_.wait(lk, [this] { return allIdleLocked(); });
@@ -364,6 +372,9 @@ void TransferQueue::runJob(Job* job) {
     ev.mode = mode;
     ev.decision = decision;
     ev.state = TransferState::Running;
+    ev.localPath = req.localPath;
+    ev.remotePath = req.remotePath;
+    ev.direction = req.direction;
     emitEvent(ev);
 
     ProgressGate gate(progressMinIntervalMs_);

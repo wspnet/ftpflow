@@ -45,6 +45,13 @@ private slots:
     void onRemoteOpFailed(const QString& msg);
     void onRemoteContextMenu(const QPoint& pos);
 
+    // Transfer dock interactions.
+    void onTransferContextMenu(const QPoint& pos);
+    void onPauseSelected();
+    void onCancelSelected();
+    void onClearFinished();
+    void onClearAll();
+
 private:
     void buildUi();
     void showRoot(const std::string& root);
@@ -71,11 +78,28 @@ private:
 
     QDockWidget* transferDock_ = nullptr;
     QListWidget* transferList_ = nullptr;
+    QPushButton* pauseBtn_ = nullptr;
+    QPushButton* cancelBtn_ = nullptr;
+    QPushButton* clearDoneBtn_ = nullptr;
 
     QLabel* statusLabel_ = nullptr;
 
     std::unique_ptr<TransferQueue> queue_;
     std::map<std::uint64_t, QListWidgetItem*> transferItems_;
+
+    // Per-job UI metadata carried on the list item (UserRole) and a
+    // side table for the paused/pending title suffix.
+    struct JobUi {
+        std::uint64_t jobId = 0;
+        QString name;
+        QString direction;       // "上传" / "下载"
+        TransferMode mode = TransferMode::Store;
+        TransferState state = TransferState::Queued;
+        double pct = 0.0;
+        bool paused = false;
+    };
+    std::map<std::uint64_t, JobUi> jobUi_;
+    void refreshTransferItem(std::uint64_t jobId, const TransferEvent* ev);
 };
 
 }  // namespace ftpflow

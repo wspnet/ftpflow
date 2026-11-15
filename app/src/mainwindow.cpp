@@ -12,6 +12,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QProgressBar>
 #include <QSortFilterProxyModel>
 #include <QSplitter>
 #include <QStatusBar>
@@ -215,13 +216,45 @@ void MainWindow::buildUi() {
 
     // --- transfer dock (bottom) --------------------------------------------------
     transferDock_ = new QDockWidget("传输队列", this);
-    transferList_ = new QListWidget(transferDock_);
+    auto* dockBody = new QWidget(transferDock_);
+    auto* dockLay = new QVBoxLayout(dockBody);
+    dockLay->setContentsMargins(4, 4, 4, 4);
+    transferList_ = new QListWidget(dockBody);
     transferList_->setAlternatingRowColors(true);
-    transferDock_->setWidget(transferList_);
+    transferList_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    transferList_->setContextMenuPolicy(Qt::CustomContextMenu);
+    dockLay->addWidget(transferList_, 1);
+
+    auto* dockBar = new QWidget(dockBody);
+    auto* dockBarLay = new QHBoxLayout(dockBar);
+    dockBarLay->setContentsMargins(0, 2, 0, 0);
+    pauseBtn_ = new QPushButton("暂停 / 继续", dockBar);
+    cancelBtn_ = new QPushButton("取消", dockBar);
+    clearDoneBtn_ = new QPushButton("清空已完成", dockBar);
+    auto* clearAllBtn = new QPushButton("清空全部", dockBar);
+    dockBarLay->addWidget(pauseBtn_);
+    dockBarLay->addWidget(cancelBtn_);
+    dockBarLay->addWidget(clearDoneBtn_);
+    dockBarLay->addWidget(clearAllBtn);
+    dockBarLay->addStretch(1);
+    dockLay->addWidget(dockBar);
+
+    transferDock_->setWidget(dockBody);
     transferDock_->setFeatures(QDockWidget::DockWidgetMovable |
                                QDockWidget::DockWidgetClosable);
     addDockWidget(Qt::BottomDockWidgetArea, transferDock_);
     transferDock_->hide();   // appears with the first job
+
+    connect(pauseBtn_, &QPushButton::clicked, this,
+            &MainWindow::onPauseSelected);
+    connect(cancelBtn_, &QPushButton::clicked, this,
+            &MainWindow::onCancelSelected);
+    connect(clearDoneBtn_, &QPushButton::clicked, this,
+            &MainWindow::onClearFinished);
+    connect(clearAllBtn, &QPushButton::clicked, this,
+            &MainWindow::onClearAll);
+    connect(transferList_, &QListWidget::customContextMenuRequested, this,
+            &MainWindow::onTransferContextMenu);
 
     auto* central = new QWidget(this);
     auto* centralLay = new QVBoxLayout(central);
@@ -492,53 +525,206 @@ void MainWindow::onTransferEvent(const TransferEvent& ev) {
     auto it = transferItems_.find(ev.jobId);
     if (it == transferItems_.end()) {
         auto* item = new QListWidgetItem;
+        item->setData(Qt::UserRole, (qulonglong)ev.jobId);
         transferList_->addItem(item);
         it = transferItems_.emplace(ev.jobId, item).first;
-    }
+        // Give the row a progress bar.
+        auto* bar = new QProgressBar;
+        bar->setRange(0, 1000);
+        bar->setValue(0);
+        bar->setTextVisible(false);
+        bar->setFixedHeight(14);
+        transferList_->setItemWidget(item, bar);
 
-    const QString arrow = ev.progress.bytesOnWire < ev.progress.bytesMoved &&
-                                  ev.progress.bytesOnWire > 0
-        ? "⇗" : "⇕";
-    const double pct = ev.progress.bytesTotal > 0
-        ? 100.0 * (double)ev.progress.bytesMoved /
-              (double)ev.progress.bytesTotal
-        : 0.0;
-    QString text = QString("%1 [job %2] %3 %4%")
-                       .arg(arrow)
-                       .arg((unsigned long long)ev.jobId)
-                       .arg(ev.mode == TransferMode::Compress
-                                    ? "压缩"
-                                    : ev.mode == TransferMode::Ftz1 ? "FTZ"
-                                                                    : "直传")
-                       .arg(pct, 0, 'f', 1);
-    if (ev.kind == TransferEvent::Kind::Progress ||
-        ev.kind == TransferEvent::Kind::Finished) {
-        text += QString("  %1/%2")
-                    .arg((unsigned long long)ev.progress.bytesMoved)
-                    .arg((unsigned long long)ev.progress.bytesTotal);
-        const QString spd = humanSpeed(ev.progress.speedBytesPerSec);
-        if (!spd.isEmpty()) text += "  " + spd;
-        if (ev.mode == TransferMode::Compress && ev.progress.bytesMoved > 0) {
-            text += QString("  压缩比 %1")
-                        .arg(ev.progress.compressionRatio, 0, 'f', 3);
-        }
+        JobUi ui;
+        ui.jobId = ev.jobId;
+        ui.direction = ev.direction == TransferDirection::Upload ? "上传"
+                                                                 : "下载";
+        ui.mode = ev.mode;
+        jobUi_[ev.jobId] = ui;
     }
-    if (ev.kind == TransferEvent::Kind::Finished) {
-        if (ev.state == TransferState::Done) {
-            text += "  ✓ 完成";
-        } else if (ev.state == TransferState::Failed) {
-            text += QString("  ✗ 失败: %1").arg(
-                QString::fromStdString(ev.error));
-        } else if (ev.state == TransferState::Canceled) {
-            text += "  已取消";
-        }
-    }
-    it->second->setText(text);
+    refreshTransferItem(ev.jobId, &ev);
 
     // Uploads may have changed the remote directory: refresh on finish.
     if (ev.kind == TransferEvent::Kind::Finished && remote_->isConnected()) {
         remote_->refresh();
     }
+}
+
+void MainWindow::refreshTransferItem(std::uint64_t jobId,
+                                     const TransferEvent* ev) {
+    auto it = transferItems_.find(jobId);
+    if (it == transferItems_.end()) return;
+    auto uiIt = jobUi_.find(jobId);
+    if (uiIt == jobUi_.end()) return;
+    JobUi& ui = uiIt->second;
+
+    if (ev) {
+        // Progress carries the effective mode and completion.
+        ui.mode = ev->mode;
+        ui.pct = ev->progress.bytesTotal > 0
+            ? 100.0 * (double)ev->progress.bytesMoved /
+                  (double)ev->progress.bytesTotal
+            : 0.0;
+        if (ev->kind == TransferEvent::Kind::Started) {
+            ui.state = TransferState::Running;
+            ui.name = ev->direction == TransferDirection::Upload
+                ? QString::fromStdString(ev->localPath)
+                : QString::fromStdString(ev->remotePath);
+            const int slash = ui.name.lastIndexOf(QChar('/'));
+            const int bslash = ui.name.lastIndexOf(QChar('\\'));
+            const int cut = qMax(slash, bslash);
+            if (cut >= 0) ui.name = ui.name.mid(cut + 1);
+        }
+        if (ev->kind == TransferEvent::Kind::Finished) {
+            ui.state = ev->state;
+            ui.paused = false;
+        }
+    }
+
+    // Compose the title.
+    QString text;
+    const QString modeStr = ui.mode == TransferMode::Compress
+        ? "压缩" : ui.mode == TransferMode::Ftz1 ? "FTZ" : "直传";
+    if (ui.state == TransferState::Queued) {
+        text = QString("[job %1] %2 · %3 · 排队中")
+                   .arg((unsigned long long)jobId).arg(ui.name).arg(modeStr);
+    } else if (ui.state == TransferState::Running) {
+        if (ui.paused) {
+            text = QString("[job %1] %2 · %3 · 已暂停 (%4%)")
+                       .arg((unsigned long long)jobId).arg(ui.name)
+                       .arg(modeStr).arg(ui.pct, 0, 'f', 1);
+        } else {
+            text = QString("[job %1] %2 · %3 · %4%")
+                       .arg((unsigned long long)jobId).arg(ui.name)
+                       .arg(modeStr).arg(ui.pct, 0, 'f', 1);
+            if (ev && (ev->kind == TransferEvent::Kind::Progress ||
+                       ev->kind == TransferEvent::Kind::Finished)) {
+                const QString spd = humanSpeed(ev->progress.speedBytesPerSec);
+                if (!spd.isEmpty())
+                    text += "  " + spd;
+            }
+        }
+    } else if (ui.state == TransferState::Done) {
+        text = QString("[job %1] %2 · %3 · ✓ 完成")
+                   .arg((unsigned long long)jobId).arg(ui.name).arg(modeStr);
+    } else if (ui.state == TransferState::Failed) {
+        text = QString("[job %1] %2 · ✗ %3")
+                   .arg((unsigned long long)jobId).arg(ui.name)
+                   .arg(ev ? QString::fromStdString(ev->error) : QString());
+    } else if (ui.state == TransferState::Canceled) {
+        text = QString("[job %1] %2 · 已取消")
+                   .arg((unsigned long long)jobId).arg(ui.name);
+    }
+    it->second->setText(text);
+
+    // Progress bar.
+    if (auto* bar = qobject_cast<QProgressBar*>(
+            transferList_->itemWidget(it->second))) {
+        bar->setValue((int)(ui.pct * 10.0));
+    }
+}
+
+// ---- transfer dock interactions -----------------------------------------
+
+namespace {
+// Collects the job ids of the currently selected transfer rows.
+std::vector<std::uint64_t> selectedJobIds(QListWidget* list) {
+    std::vector<std::uint64_t> ids;
+    for (QListWidgetItem* item : list->selectedItems()) {
+        ids.push_back((std::uint64_t)item->data(Qt::UserRole).toULongLong());
+    }
+    return ids;
+}
+}  // namespace
+
+void MainWindow::onTransferContextMenu(const QPoint& pos) {
+    const QModelIndex idx = transferList_->indexAt(pos);
+    if (!idx.isValid()) return;
+
+    QMenu menu(this);
+    QAction* pauseAction = menu.addAction("暂停 / 继续");
+    QAction* cancelAction = menu.addAction("取消");
+    menu.addSeparator();
+    QAction* clearAction = menu.addAction("清空已完成");
+    QAction* clearAllAction = menu.addAction("清空全部");
+
+    QAction* chosen =
+        menu.exec(transferList_->viewport()->mapToGlobal(pos));
+    if (!chosen) return;
+    if (chosen == pauseAction) onPauseSelected();
+    else if (chosen == cancelAction) onCancelSelected();
+    else if (chosen == clearAction) onClearFinished();
+    else if (chosen == clearAllAction) onClearAll();
+}
+
+void MainWindow::onPauseSelected() {
+    const auto ids = selectedJobIds(transferList_);
+    if (ids.empty()) {
+        statusBar()->showMessage("未选中传输任务", 4000);
+        return;
+    }
+    for (std::uint64_t id : ids) {
+        auto uiIt = jobUi_.find(id);
+        if (uiIt == jobUi_.end()) continue;
+        if (uiIt->second.state == TransferState::Running ||
+            uiIt->second.state == TransferState::Queued) {
+            if (queue_->isPaused(id)) {
+                queue_->resume(id);
+                uiIt->second.paused = false;
+            } else {
+                queue_->pause(id);
+                uiIt->second.paused = true;
+            }
+            refreshTransferItem(id, nullptr);
+        }
+    }
+}
+
+void MainWindow::onCancelSelected() {
+    const auto ids = selectedJobIds(transferList_);
+    if (ids.empty()) {
+        statusBar()->showMessage("未选中传输任务", 4000);
+        return;
+    }
+    for (std::uint64_t id : ids) {
+        queue_->cancel(id);
+    }
+}
+
+void MainWindow::onClearFinished() {
+    // Remove rows that have reached a terminal (non-running) state.
+    std::vector<std::uint64_t> toRemove;
+    for (auto& [id, item] : transferItems_) {
+        auto uiIt = jobUi_.find(id);
+        if (uiIt == jobUi_.end()) continue;
+        const TransferState s = uiIt->second.state;
+        if (s == TransferState::Done || s == TransferState::Failed ||
+            s == TransferState::Canceled) {
+            toRemove.push_back(id);
+        }
+    }
+    for (std::uint64_t id : toRemove) {
+        delete transferItems_[id];
+        transferItems_.erase(id);
+        jobUi_.erase(id);
+    }
+    if (transferItems_.empty()) transferDock_->hide();
+}
+
+void MainWindow::onClearAll() {
+    // Cancel everything still pending/running, then drop every row.
+    for (auto& [id, item] : transferItems_) {
+        (void)item;
+        queue_->cancel(id);
+    }
+    for (auto& [id, item] : transferItems_) {
+        (void)id;
+        delete item;
+    }
+    transferItems_.clear();
+    jobUi_.clear();
+    transferDock_->hide();
 }
 
 void MainWindow::refreshStatusBar() {

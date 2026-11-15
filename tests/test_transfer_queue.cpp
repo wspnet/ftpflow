@@ -203,8 +203,12 @@ int main() {
             req.remotePath = "/tq_pause.bin";
             const std::uint64_t id = q.enqueue(req);
             CHECK(q.pause(id));            // park from the very first chunk
+            CHECK(q.isPaused(id));         // the flag is observable
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             CHECK(r.finished.load() == 0); // still parked, not finished
+            CHECK(q.resume(id));           // clear the flag
+            CHECK(!q.isPaused(id));
+            CHECK(q.pause(id));            // park again
             CHECK(q.cancel(id));           // abort while parked
             q.waitAll();
             CHECK(r.finished.load() == 1);

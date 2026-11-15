@@ -90,6 +90,11 @@ struct TransferEvent {
     TransferProgress progress;
     Decision decision;                          // funnel result (Started)
     std::string error;                          // Failed detail
+    // Source/target paths, populated on Started so the UI can label the
+    // row without keeping the original request around.
+    std::string localPath;
+    std::string remotePath;
+    TransferDirection direction = TransferDirection::Upload;
 };
 
 class TransferQueue {
@@ -120,6 +125,11 @@ public:
     bool cancel(std::uint64_t jobId);
     bool pause(std::uint64_t jobId);    // running job parks between chunks
     bool resume(std::uint64_t jobId);
+
+    // True while a job's pause flag is set (the backend parks between
+    // chunks; the job is still Running until it observes the flag). The
+    // UI uses this to reflect the requested pause state immediately.
+    bool isPaused(std::uint64_t jobId) const;
 
     // Blocks until no job is queued or running.
     void waitAll();
