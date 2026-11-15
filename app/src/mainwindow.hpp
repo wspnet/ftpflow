@@ -88,9 +88,8 @@ private:
 
     // Transfer queue plumbing (events arrive on worker threads).
     void onTransferEvent(const TransferEvent& ev);
-    void enqueueUploads();
-    void enqueueDownloads();
-    // Drop-target variants: enqueue a specific set of paths.
+    // Drop-target variants: enqueue a specific set of paths (transfers are
+    // driven entirely by drag & drop).
     void enqueueLocalToRemote(const QStringList& localPaths);
     void enqueueRemoteToLocal(const QStringList& remotePaths);
 

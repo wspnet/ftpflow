@@ -189,25 +189,6 @@ void MainWindow::buildUi() {
     connect(model_, &LocalFsModel::verdictsReady, this,
             &MainWindow::onVerdictsReady);
 
-    // --- transfer arrow column (middle) ------------------------------------
-    auto* arrows = new QWidget(this);
-    auto* arrowLay = new QVBoxLayout(arrows);
-    arrowLay->setContentsMargins(4, 4, 4, 4);
-    arrowLay->addStretch(1);
-    auto* uploadBtn = new QPushButton("上传 →", arrows);
-    auto* downloadBtn = new QPushButton("← 下载", arrows);
-    uploadBtn->setProperty("accent", true);
-    downloadBtn->setProperty("accent", true);
-    uploadBtn->setMinimumWidth(88);
-    downloadBtn->setMinimumWidth(88);
-    arrowLay->addWidget(uploadBtn);
-    arrowLay->addWidget(downloadBtn);
-    arrowLay->addStretch(1);
-    connect(uploadBtn, &QPushButton::clicked, this,
-            &MainWindow::enqueueUploads);
-    connect(downloadBtn, &QPushButton::clicked, this,
-            &MainWindow::enqueueDownloads);
-
     // --- remote pane (right): tabbed, one session per tab ------------------
     auto* rightPane = new QWidget(this);
     auto* rightLay = new QVBoxLayout(rightPane);
@@ -234,11 +215,10 @@ void MainWindow::buildUi() {
     // --- splitters -------------------------------------------------------------
     auto* splitter = new QSplitter(Qt::Horizontal, this);
     splitter->addWidget(leftPane);
-    splitter->addWidget(arrows);
     splitter->addWidget(rightPane);
     splitter->setStretchFactor(0, 1);
-    splitter->setStretchFactor(1, 0);
-    splitter->setStretchFactor(2, 1);
+    splitter->setStretchFactor(1, 1);
+    splitter->setCollapsible(0, false);
     splitter->setCollapsible(1, false);
 
     // --- transfer dock (bottom) --------------------------------------------------
@@ -808,49 +788,6 @@ void MainWindow::enqueueRemoteToLocal(const QStringList& remotePaths) {
         }
     }
     transferDock_->show();
-}
-
-void MainWindow::enqueueUploads() {
-    RemoteFsModel* rm = currentRemote();
-    if (!rm || !rm->isConnected()) {
-        statusBar()->showMessage("请先连接远端", 4000);
-        return;
-    }
-    const QModelIndexList rows = left_->selectionModel()->selectedRows(0);
-    if (rows.isEmpty()) {
-        statusBar()->showMessage("未选中本地条目", 4000);
-        return;
-    }
-    QStringList paths;
-    for (const QModelIndex& proxyIdx : rows) {
-        const QModelIndex src = proxy_->mapToSource(proxyIdx);
-        const QString p = model_->pathAt(src);
-        if (!p.isEmpty()) paths << p;
-    }
-    enqueueLocalToRemote(paths);
-}
-
-void MainWindow::enqueueDownloads() {
-    RemoteFsModel* rm = currentRemote();
-    if (!rm || !rm->isConnected()) {
-        statusBar()->showMessage("请先连接远端", 4000);
-        return;
-    }
-    RemoteTab* tab = currentTab();
-    const QModelIndexList rows = tab->table->selectionModel()->selectedRows(0);
-    if (rows.isEmpty()) {
-        statusBar()->showMessage("未选中远端条目", 4000);
-        return;
-    }
-    QStringList paths;
-    for (const QModelIndex& proxyIdx : rows) {
-        const QModelIndex src = tab->proxy->mapToSource(proxyIdx);
-        std::string p = rm->pathAt(src);
-        if (p.empty()) continue;
-        if (rm->isDir(src)) p += "/";
-        paths << QString::fromStdString(p);
-    }
-    enqueueRemoteToLocal(paths);
 }
 
 void MainWindow::onTransferEvent(const TransferEvent& ev) {
