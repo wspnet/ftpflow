@@ -10,7 +10,11 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+
 #include "ftpflow/compress_decide.hpp"
+#include "ftpflow/dir_cache.hpp"
+#include "ftpflow/fs_watcher.hpp"
 #include "ftpflow/vfs_local.hpp"
 
 namespace ftpflow {
@@ -65,9 +69,13 @@ private:
     void appendPage(const ListingPage& page);
     void startVerdictBatch(int from, int count);
     void onVerdictsFinished();
+    void onDirChangedExternal(const std::string& dir);
     Entry entryAt(int row) const { return entries_[static_cast<std::size_t>(row)]; }
+    std::string currentFullPath() const;
 
     LocalFsBackend backend_;
+    DirCache cache_;                     // full-listing snapshots per dir
+    std::unique_ptr<FsWatcher> watcher_; // auto-invalidate on external change
     std::string root_;                    // bound root (absolute)
     std::string currentDir_;              // relative, "" = root
     std::vector<Entry> entries_;

@@ -15,6 +15,7 @@
 
 #include <windows.h>
 
+#include "ftpflow/dir_cache.hpp"
 #include "ftpflow/vfs_local.hpp"
 
 namespace {
@@ -99,7 +100,28 @@ int main(int argc, char** argv) {
     std::printf("first page     : %.1f ms cold, %.1f ms warm  (budget 300 ms)\n",
                 firstPageMs, warmFirstPageMs);
     std::printf("full enumerate : %.1f ms\n", fullMs);
+
+    // --- DirCache: the fix for the repeated-enumeration paging cost. ---
+    ftpflow::DirCache cache;
+    bool fromCache = true;
+    const auto t2 = Clock::now();
+    ftpflow::ListingPage cp = cache.list(fs, dir, {}, 500, &fromCache);
+    const double cacheFirstMs = msSince(t2);         // miss: enumerate once
+    const bool firstWasCached = fromCache;
+    std::size_t cachedTotal = cp.entries.size();
+    const auto t3 = Clock::now();
+    while (cp.hasMore) {                              // every page: memory slice
+        cp = cache.list(fs, dir, cp.cursor, 500, &fromCache);
+        cachedTotal += cp.entries.size();
+    }
+    const double cachePagedMs = msSince(t3);
+    auto cs = cache.stats();
+    std::printf("cache          : first %.1f ms (cached=%d), paged walk %zu entries in %.1f ms (%d hits)\n",
+                cacheFirstMs, (int)firstWasCached, cachedTotal, cachePagedMs,
+                (int)cs.hits);
+
     std::printf("verdict        : %s\n",
-                warmFirstPageMs < 300.0 ? "PASS" : "OVER BUDGET");
-    return warmFirstPageMs < 300.0 ? 0 : 1;
+                warmFirstPageMs < 300.0 && cachePagedMs < 50.0
+                    ? "PASS" : "OVER BUDGET");
+    return (warmFirstPageMs < 300.0 && cachePagedMs < 50.0) ? 0 : 1;
 }

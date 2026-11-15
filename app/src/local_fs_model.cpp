@@ -3,6 +3,7 @@
 
 #include <QtConcurrent/QtConcurrentMap>
 #include <QtCore/QDateTime>
+#include <QtCore/QMetaObject>
 #include <cstdio>
 #include <cstring>
 
@@ -97,13 +98,47 @@ bool LocalFsModel::openRoot(const std::string& root, std::string* error) {
     root_ = root;
     currentDir_.clear();
     listingValid_ = true;
+    cache_.clear();
+    // Watch the root (and later each browsed directory) so external
+    // changes invalidate the cache and refresh the view. The callback
+    // runs on the watcher thread: marshal to the UI thread.
+    watcher_ = std::make_unique<FsWatcher>(
+        [this](const std::string& changed) {
+            cache_.invalidate(changed);
+            QMetaObject::invokeMethod(
+                this,
+                [this, changed] { onDirChangedExternal(changed); },
+                Qt::QueuedConnection);
+        });
+    watcher_->watch(currentFullPath());
     loadFirstPage();
     return true;
+}
+
+std::string LocalFsModel::currentFullPath() const {
+    std::string full = root_;
+    while (!full.empty() && (full.back() == '/' || full.back() == '\\'))
+        full.pop_back();
+    if (!currentDir_.empty()) {
+        full += "/";
+        full += currentDir_;
+    }
+    return full;
+}
+
+void LocalFsModel::onDirChangedExternal(const std::string& dir) {
+    // Only reload when the change affects the directory on screen. The
+    // cache is already invalidated (watcher thread did that); this just
+    // refreshes rows.
+    if (dir != currentFullPath()) return;
+    if (!listingValid_) return;
+    loadFirstPage();
 }
 
 bool LocalFsModel::enterDir(const std::string& relative) {
     if (!listingValid_) return false;
     currentDir_ = relative;
+    if (watcher_) watcher_->watch(currentFullPath());
     loadFirstPage();
     return true;
 }
@@ -128,7 +163,7 @@ void LocalFsModel::loadFirstPage() {
     batchJobs_.clear();
     batchPending_ = false;
 
-    ListingPage page = backend_.list(currentDir_, {}, 500);
+    ListingPage page = cache_.list(backend_, currentFullPath(), {}, 500);
     appendPage(page);
 }
 
@@ -236,7 +271,8 @@ bool LocalFsModel::canFetchMore(const QModelIndex& parent) const {
 
 void LocalFsModel::fetchMore(const QModelIndex& parent) {
     if (parent.isValid() || !canFetchMore(parent)) return;
-    ListingPage page = backend_.list(currentDir_, lastOfCurrentPage_, 500);
+    ListingPage page =
+        cache_.list(backend_, currentFullPath(), lastOfCurrentPage_, 500);
     appendPage(page);
 }
 
