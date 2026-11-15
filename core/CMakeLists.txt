@@ -20,6 +20,7 @@ target_sources(ftpflow_core PRIVATE
     src/compress_trial.cpp
     src/sha256.cpp
     src/ssh_exec.cpp
+    src/sftp_session.cpp
     src/ssh_transfer.cpp
     src/ftp_session.cpp
     src/ftz1.cpp

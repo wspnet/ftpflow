@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <io.h>
+#include <sys/stat.h>
 
 #if defined(FTPFLOW_HAVE_ZSTD)
 #include <zstd.h>
@@ -15,6 +16,7 @@
 
 #include "ftpflow/compress_decide.hpp"
 #include "ftpflow/ftp_session.hpp"
+#include "ftpflow/sftp_session.hpp"
 #include "ftpflow/protocol_status.hpp"
 #include "ftpflow/ssh_exec.hpp"
 #include "ftpflow/ssh_transfer.hpp"
@@ -451,6 +453,143 @@ int cmdFtp(const std::vector<std::string>& a) {
     return 0;
 }
 
+// sftp <cmd> <host[:port]> <user> <password|-> [--key <path>] ...
+//   ls   [dir]              list a directory (structured readdir)
+//   size <remote>           remote file size
+//   get  <remote> <local>   download
+//   put  <local> <remote>   upload
+//   mkdir|rmdir|rm|chmod    metadata ops
+int cmdSftp(const std::vector<std::string>& a) {
+    if (a.size() < 4) {
+        std::fprintf(stderr,
+            "usage: ftpcli sftp <cmd> <host[:port]> <user> <password|-> [--key <path>] ...\n"
+            "  ls <dir> | size <r> | get <r> <l> | put <l> <r>\n"
+            "  mkdir <dir> | rmdir <dir> | rm <file> | chmod <path> <mode>\n"
+            "  password '-' + --key <path> selects private-key auth.\n");
+        return 2;
+    }
+    const std::string& cmd = a[0];
+    ftpflow::SshEndpoint ep;
+    ep.host = a[1];
+    ep.user = a[2];
+    ep.password = a[3];
+    const std::size_t colon = ep.host.rfind(':');
+    if (colon != std::string::npos && colon + 1 < ep.host.size()) {
+        ep.port = static_cast<std::uint16_t>(std::atoi(ep.host.c_str() + colon + 1));
+        ep.host = ep.host.substr(0, colon);
+    }
+    std::vector<std::string> rest;
+    for (std::size_t i = 4; i < a.size(); ++i) {
+        if (a[i] == "--key" && i + 1 < a.size()) {
+            ep.privateKeyPem = readWholeFile(a[++i]);
+            if (ep.privateKeyPem.empty()) {
+                std::fprintf(stderr, "sftp: cannot read key file %s\n", a[i].c_str());
+                return 2;
+            }
+        } else {
+            rest.push_back(a[i]);
+        }
+    }
+
+    ftpflow::SftpSession sftp(ftpflow::HostKeyPolicy::AcceptNew);
+    std::string acceptedKey;
+    ftpflow::SftpResult r = sftp.open(ep, {}, &acceptedKey);
+    if (!r.ok()) {
+        std::fprintf(stderr, "sftp open failed [%s]: %s\n",
+            ftpflow::sftpStatusName(r.status), r.message.c_str());
+        return 1;
+    }
+    if (!acceptedKey.empty()) {
+        std::fprintf(stderr, "host key (TOFU accepted): sha256-blob %s\n",
+            acceptedKey.substr(0, 64).c_str());
+    }
+
+    auto fail = [](const ftpflow::SftpResult& x) {
+        std::fprintf(stderr, "sftp failed [%s]: %s\n",
+            ftpflow::sftpStatusName(x.status), x.message.c_str());
+        return 1;
+    };
+
+    if (cmd == "ls") {
+        const std::string dir = rest.empty() ? "." : rest[0];
+        ftpflow::ListingPage page = sftp.list(dir);
+        if (!page.cursor.empty() && page.entries.empty()) {
+            // list() reports failure through cursor+empty (session/protocol
+            // errors carry the message).
+            std::fprintf(stderr, "sftp ls failed: %s\n", page.cursor.c_str());
+            return 1;
+        }
+        std::printf("%-40s %12s %s\n", "NAME", "SIZE", "TYPE");
+        for (const auto& e : page.entries) {
+            const char* t = e.type == ftpflow::EntryType::Directory ? "dir"
+                          : e.type == ftpflow::EntryType::Symlink ? "link" : "file";
+            std::printf("%-40s %12llu %s\n", e.name.c_str(),
+                static_cast<unsigned long long>(e.size), t);
+        }
+        return 0;
+    }
+    if (cmd == "size") {
+        if (rest.empty()) { std::fprintf(stderr, "size: need <remote>\n"); return 2; }
+        std::uint64_t n = 0;
+        ftpflow::SftpResult sr = sftp.size(rest[0], &n);
+        if (!sr.ok()) return fail(sr);
+        std::printf("%llu\n", static_cast<unsigned long long>(n));
+        return 0;
+    }
+    if (cmd == "get") {
+        bool resume = false;
+        if (!rest.empty() && rest[0] == "--resume") { resume = true; rest.erase(rest.begin()); }
+        if (rest.size() < 2) { std::fprintf(stderr, "get: need <remote> <local>\n"); return 2; }
+        std::uint64_t resumeBytes = 0;
+        if (resume) {
+            struct _stat64 st{};
+            if (_stat64(rest[1].c_str(), &st) == 0) resumeBytes = (std::uint64_t)st.st_size;
+        }
+        std::uint64_t moved = 0;
+        ftpflow::SftpResult gr = sftp.download(rest[0], rest[1], resumeBytes, &moved);
+        if (!gr.ok()) return fail(gr);
+        std::printf("downloaded %llu bytes%s\n",
+            static_cast<unsigned long long>(moved),
+            resume ? " (resumed)" : "");
+        return 0;
+    }
+    if (cmd == "put") {
+        if (rest.size() < 2) { std::fprintf(stderr, "put: need <local> <remote>\n"); return 2; }
+        std::uint64_t moved = 0;
+        ftpflow::SftpResult pr = sftp.upload(rest[0], rest[1], 0, &moved);
+        if (!pr.ok()) return fail(pr);
+        std::printf("uploaded %llu bytes\n", static_cast<unsigned long long>(moved));
+        return 0;
+    }
+    if (cmd == "mkdir") {
+        if (rest.empty()) { std::fprintf(stderr, "mkdir: need <dir>\n"); return 2; }
+        ftpflow::SftpResult mr = sftp.mkdir(rest[0]);
+        if (mr.ok()) { std::printf("mkdir ok\n"); return 0; }
+        return fail(mr);
+    }
+    if (cmd == "rmdir") {
+        if (rest.empty()) { std::fprintf(stderr, "rmdir: need <dir>\n"); return 2; }
+        ftpflow::SftpResult dr = sftp.removeDir(rest[0]);
+        if (dr.ok()) { std::printf("rmdir ok\n"); return 0; }
+        return fail(dr);
+    }
+    if (cmd == "rm") {
+        if (rest.empty()) { std::fprintf(stderr, "rm: need <file>\n"); return 2; }
+        ftpflow::SftpResult rr = sftp.removeFile(rest[0]);
+        if (rr.ok()) { std::printf("rm ok\n"); return 0; }
+        return fail(rr);
+    }
+    if (cmd == "chmod") {
+        if (rest.size() < 2) { std::fprintf(stderr, "chmod: need <path> <mode>\n"); return 2; }
+        ftpflow::SftpResult cr = sftp.chmod(rest[0],
+            (std::uint32_t)std::strtoul(rest[1].c_str(), nullptr, 8));
+        if (cr.ok()) { std::printf("chmod ok\n"); return 0; }
+        return fail(cr);
+    }
+    std::fprintf(stderr, "sftp: unknown subcommand %s\n", cmd.c_str());
+    return 2;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -462,6 +601,7 @@ int main(int argc, char** argv) {
             "  ftpcli decide [--bw MIBPS] <file...>   run the 5-stage funnel\n"
             "  ftpcli info <dir>                      directory listing smoke test\n"
             "  ftpcli ftp ls|size|get|put <host> ...  FTP smoke surface\n"
+            "  ftpcli sftp ls|size|get|put <host> ... [--key K]  SFTP surface\n"
             "  ftpcli ssh exec <host[:port]> <user> <password> <cmd...>\n"
             "  ftpcli ssh push <host> <user> <pw|-> [--key K] [--level N]\n"
             "                   [--cmd T] <local> <remote>   zstd exec-channel push\n"
@@ -475,6 +615,7 @@ int main(int argc, char** argv) {
     if (cmd == "decide") return cmdDecide(rest);
     if (cmd == "info") return cmdInfo(rest);
     if (cmd == "ftp") return cmdFtp(rest);
+    if (cmd == "sftp") return cmdSftp(rest);
     if (cmd == "zdecode") return cmdZdecode(rest);
     if (cmd == "ssh") {
         if (rest.empty() || (rest[0] != "exec" && rest[0] != "push")) {
