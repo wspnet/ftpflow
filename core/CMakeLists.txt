@@ -26,20 +26,21 @@ target_sources(ftpflow_core PRIVATE
 if(FTPFLOW_WITH_CURL)
     find_package(CURL CONFIG REQUIRED)
     target_link_libraries(ftpflow_core PRIVATE CURL::libcurl)
-    target_compile_definitions(ftpflow_core PRIVATE FTPFLOW_HAVE_CURL=1)
+    # PUBLIC: core consumers (CLI/tests/GUI) feature-probe via this macro.
+    target_compile_definitions(ftpflow_core PUBLIC FTPFLOW_HAVE_CURL=1)
 endif()
 
 if(FTPFLOW_WITH_LIBSSH2)
     find_package(libssh2 CONFIG REQUIRED)
     target_link_libraries(ftpflow_core PRIVATE libssh2::libssh2)
-    target_compile_definitions(ftpflow_core PRIVATE FTPFLOW_HAVE_LIBSSH2=1)
+    target_compile_definitions(ftpflow_core PUBLIC FTPFLOW_HAVE_LIBSSH2=1)
 endif()
 
 if(FTPFLOW_WITH_ZSTD)
     # vcpkg zstd port exports zstd::libzstd (usage file).
     find_package(zstd CONFIG REQUIRED)
     target_link_libraries(ftpflow_core PRIVATE zstd::libzstd)
-    target_compile_definitions(ftpflow_core PRIVATE FTPFLOW_HAVE_ZSTD=1)
+    target_compile_definitions(ftpflow_core PUBLIC FTPFLOW_HAVE_ZSTD=1)
 endif()
 
 # FTP / SFTP backends are added as separate sources behind these guards in

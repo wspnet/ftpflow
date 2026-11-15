@@ -88,8 +88,10 @@ int main() {
         CHECK(a == Sha256::hex(s, std::strlen(s)));
     }
 
-    // SSH exec stub: engine-unavailable status is well-formed even without
-    // libssh2, so callers can feature-probe at runtime.
+    // SSH exec stub: a no-libssh2 build must return EngineUnavailable so
+    // callers can feature-probe; a libssh2 build will really attempt the
+    // connection (localhost may or may not run sshd, and 'nobody' won't
+    // authenticate) -- either way it must fail cleanly and never hang.
     {
         SshExec ssh;
         SshEndpoint ep;
@@ -97,7 +99,11 @@ int main() {
         ep.user = "nobody";
         SshResult r = ssh.open(ep, "true", {});
         CHECK(!r.ok());
-        CHECK(r.status == SshStatus::EngineUnavailable || r.status == SshStatus::ConnectFailed);
+#if FTPFLOW_HAVE_LIBSSH2
+        CHECK(r.status != SshStatus::EngineUnavailable);
+#else
+        CHECK(r.status == SshStatus::EngineUnavailable);
+#endif
         CHECK(std::strlen(sshStatusName(r.status)) > 0);
         CHECK(!ssh.isOpen());
         CHECK(ssh.exitCode() == -1);

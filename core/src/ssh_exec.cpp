@@ -233,6 +233,15 @@ SshResult SshExec::write(const void* data, std::size_t len, int timeoutMs) {
     return {};
 }
 
+void SshExec::setStdoutSink(std::function<void(const void*, std::size_t)> fn) {
+    if (impl_ == nullptr) impl_ = new Impl();
+    impl_->onStdout = std::move(fn);
+}
+void SshExec::setStderrSink(std::function<void(const void*, std::size_t)> fn) {
+    if (impl_ == nullptr) impl_ = new Impl();
+    impl_->onStderr = std::move(fn);
+}
+
 bool SshExec::pump(int timeoutMs) {
     if (state_ != State::Open || !impl_ || !impl_->channel) return false;
 
@@ -255,6 +264,14 @@ bool SshExec::pump(int timeoutMs) {
     }
 
     if (libssh2_channel_eof(impl_->channel)) {
+        // The exit status arrives in a channel-close message that must be
+        // consumed on a non-blocking session. Loop wait_closed until it
+        // stops returning EAGAIN, then read the status.
+        int wc;
+        while ((wc = libssh2_channel_wait_closed(impl_->channel))
+               == LIBSSH2_ERROR_EAGAIN) {
+            waitSocket(impl_->sock, false, 200);
+        }
         exitCode_ = libssh2_channel_get_exit_status(impl_->channel);
         close();
         return false;

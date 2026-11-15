@@ -9,6 +9,7 @@
 
 #include "ftpflow/compress_decide.hpp"
 #include "ftpflow/protocol_status.hpp"
+#include "ftpflow/ssh_exec.hpp"
 #include "ftpflow/version.hpp"
 #include "ftpflow/vfs_local.hpp"
 
@@ -121,6 +122,103 @@ int cmdInfo(const std::vector<std::string>& args) {
     return 0;
 }
 
+// ssh exec <host> <user> <password|-> [--key <path>] <command...>
+//   Connects, handshakes, accepts the host key on first use (prints its
+//   fingerprint), runs `command` on a single exec channel, and streams
+//   stdout/stderr back. This is the end-to-end check for the exec-channel
+//   compression fast path. A password of "-" plus --key <path> selects
+//   private-key auth (PEM/OpenSSH read from disk).
+static std::string readWholeFile(const std::string& path) {
+    std::string s;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return s;
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (n > 0) {
+        s.resize(static_cast<std::size_t>(n));
+        std::fread(&s[0], 1, static_cast<std::size_t>(n), f);
+    }
+    std::fclose(f);
+    return s;
+}
+
+int cmdSshExec(const std::vector<std::string>& args) {
+    if (args.size() < 4) {
+        std::fprintf(stderr,
+            "usage: ftpcli ssh exec <host> <user> <password|-> [--key <path>] <command...>\n"
+            "  runs <command> on one exec channel; first-use host key is\n"
+            "  accepted and printed (TOFU) so it can be pinned later.\n"
+            "  password '-' + --key <path> selects private-key auth.\n");
+        return 2;
+    }
+    ftpflow::SshEndpoint ep;
+    ep.host = args[0];
+    ep.user = args[1];
+    ep.password = args[2];
+    // <host> may carry :port
+    const std::size_t colon = ep.host.rfind(':');
+    if (colon != std::string::npos && colon + 1 < ep.host.size()) {
+        ep.port = static_cast<std::uint16_t>(std::atoi(ep.host.c_str() + colon + 1));
+        ep.host = ep.host.substr(0, colon);
+    }
+    std::vector<std::string> commandParts;
+    for (std::size_t i = 3; i < args.size(); ++i) {
+        if (args[i] == "--key" && i + 1 < args.size()) {
+            ep.privateKeyPem = readWholeFile(args[++i]);
+            if (ep.privateKeyPem.empty()) {
+                std::fprintf(stderr, "ssh exec: cannot read key file %s\n", args[i].c_str());
+                return 2;
+            }
+        } else {
+            commandParts.push_back(args[i]);
+        }
+    }
+    std::string command;
+    for (std::size_t i = 0; i < commandParts.size(); ++i) {
+        if (i > 0) command += ' ';
+        command += commandParts[i];
+    }
+    if (command.empty()) {
+        std::fprintf(stderr, "ssh exec: no command given\n");
+        return 2;
+    }
+
+    ftpflow::SshExec ssh(ftpflow::HostKeyPolicy::AcceptNew);
+    std::string acceptedKey;
+
+    // Capture remote stdout/stderr, printing each stream as it arrives.
+    ssh.setStdoutSink([](const void* p, std::size_t n) {
+        std::fwrite(p, 1, n, stdout);
+    });
+    ssh.setStderrSink([](const void* p, std::size_t n) {
+        std::fwrite(p, 1, n, stderr);
+    });
+
+    ftpflow::SshResult r = ssh.open(ep, command, {}, &acceptedKey);
+    if (!r.ok()) {
+        std::fprintf(stderr, "ssh open failed [%s]: %s\n",
+            ftpflow::sshStatusName(r.status), r.message.c_str());
+        return 1;
+    }
+    if (!acceptedKey.empty()) {
+        std::fprintf(stderr, "host key (TOFU accepted): sha256-blob %s\n",
+            acceptedKey.substr(0, 64).c_str());
+    }
+
+    // Drain stdout/stderr until the channel closes.
+    while (ssh.pump(500)) {
+    }
+    std::fflush(stdout);
+    std::fflush(stderr);
+
+    std::printf("\nexit=%d bytes_read=%llu bytes_written=%llu\n",
+        ssh.exitCode(),
+        static_cast<unsigned long long>(ssh.stats().bytesRead),
+        static_cast<unsigned long long>(ssh.stats().bytesWritten));
+    return ssh.exitCode() == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -130,7 +228,8 @@ int main(int argc, char** argv) {
             "ftpcli %s\n"
             "  ftpcli version\n"
             "  ftpcli decide [--bw MIBPS] <file...>   run the 5-stage funnel\n"
-            "  ftpcli info <dir>                      directory listing smoke test\n",
+            "  ftpcli info <dir>                      directory listing smoke test\n"
+            "  ftpcli ssh exec <host[:port]> <user> <password> <cmd...>\n",
             ftpflow::versionString());
         return args.empty() ? 2 : 0;
     }
@@ -139,6 +238,13 @@ int main(int argc, char** argv) {
     if (cmd == "version") return cmdVersion();
     if (cmd == "decide") return cmdDecide(rest);
     if (cmd == "info") return cmdInfo(rest);
+    if (cmd == "ssh") {
+        if (rest.empty() || rest[0] != "exec") {
+            std::fprintf(stderr, "usage: ftpcli ssh exec <host> <user> <password> <cmd...>\n");
+            return 2;
+        }
+        return cmdSshExec(std::vector<std::string>(rest.begin() + 1, rest.end()));
+    }
     std::fprintf(stderr, "unknown command: %s (try --help)\n", cmd.c_str());
     return 2;
 }

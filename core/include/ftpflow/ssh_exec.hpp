@@ -100,6 +100,11 @@ public:
     // (check exitCode()).
     bool pump(int timeoutMs = 500);
 
+    // Register stdout/stderr sinks; invoked from pump() on the caller's
+    // thread. Set before pump() to capture the remote command's output.
+    void setStdoutSink(std::function<void(const void*, std::size_t)> fn);
+    void setStderrSink(std::function<void(const void*, std::size_t)> fn);
+
     void close();
 
     // Remote exit status when the channel closed cleanly, else -1.
