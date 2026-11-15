@@ -14,6 +14,7 @@
 #include <QPushButton>
 #include <QProgressBar>
 #include <QSortFilterProxyModel>
+#include <QSpinBox>
 #include <QSplitter>
 #include <QStatusBar>
 #include <QTableView>
@@ -293,6 +294,14 @@ void MainWindow::buildUi() {
     dockBarLay->addWidget(clearDoneBtn_);
     dockBarLay->addWidget(clearAllBtn);
     dockBarLay->addStretch(1);
+    // Concurrent worker count (live: applies to the queue immediately).
+    dockBarLay->addWidget(new QLabel("并发:", dockBar));
+    workersSpin_ = new QSpinBox(dockBar);
+    workersSpin_->setRange(1, 64);
+    workersSpin_->setValue(static_cast<int>(queue_->workerCount()));
+    workersSpin_->setToolTip(
+        "同时传输的 worker 数（1-64）。调小会让多余 worker 跑完当前文件后退出。");
+    dockBarLay->addWidget(workersSpin_);
     dockLay->addWidget(dockBar);
 
     transferDock_->setWidget(dockBody);
@@ -309,6 +318,11 @@ void MainWindow::buildUi() {
             &MainWindow::onClearFinished);
     connect(clearAllBtn, &QPushButton::clicked, this,
             &MainWindow::onClearAll);
+    connect(workersSpin_, &QSpinBox::valueChanged, this, [this](int v) {
+        queue_->setWorkers(static_cast<unsigned>(v));
+        statusBar()->showMessage(
+            QString("并发 worker 数已设为 %1").arg(v), 3000);
+    });
     connect(transferList_, &QListWidget::customContextMenuRequested, this,
             &MainWindow::onTransferContextMenu);
 

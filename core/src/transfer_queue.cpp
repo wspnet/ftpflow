@@ -149,6 +149,8 @@ std::uint64_t localFileSize(const std::string& path) {
 TransferQueue::TransferQueue(unsigned workers, int progressMinIntervalMs)
     : progressMinIntervalMs_(progressMinIntervalMs) {
     if (workers == 0) workers = 1;
+    if (workers > 64) workers = 64;
+    workerTarget_.store(workers);
     for (unsigned i = 0; i < workers; ++i) {
         workers_.emplace_back([this, i] { workerLoop(static_cast<int>(i)); });
     }
@@ -331,6 +333,37 @@ std::size_t TransferQueue::pending() const {
     return queue_.size() + running_;
 }
 
+unsigned TransferQueue::workerCount() const {
+    return workerTarget_.load();
+}
+
+void TransferQueue::setWorkers(unsigned n) {
+    if (n == 0) n = 1;
+    if (n > 64) n = 64;
+    const unsigned cur = workerTarget_.load();
+    if (n == cur) return;
+
+    if (n < cur) {
+        // Shrink: surplus workers finish their current job, then exit. The
+        // workers with index >= n are the ones to retire.
+        workerTarget_.store(n);
+        cvPop_.notify_all();   // wake any idle surplus workers to observe the target
+        // Join the retiring workers (index n..cur-1). They are the tail of
+        // workers_; join blocks until each has observed the target and left
+        // workerLoop (after finishing its in-flight job, if any).
+        for (unsigned i = n; i < cur; ++i) {
+            if (i < workers_.size() && workers_[i].joinable()) workers_[i].join();
+        }
+        workers_.erase(workers_.begin() + n, workers_.end());
+    } else {
+        // Grow: spawn n - cur additional workers.
+        workerTarget_.store(n);
+        for (unsigned i = cur; i < n; ++i) {
+            workers_.emplace_back([this, i] { workerLoop(static_cast<int>(i)); });
+        }
+    }
+}
+
 void TransferQueue::emitEvent(const TransferEvent& ev) {
     EventCallback cb;
     {
@@ -340,11 +373,15 @@ void TransferQueue::emitEvent(const TransferEvent& ev) {
     if (cb) cb(ev);
 }
 
-std::shared_ptr<TransferQueue::Job> TransferQueue::popJob() {
+std::shared_ptr<TransferQueue::Job> TransferQueue::popJob(int workerIndex) {
     std::unique_lock<std::mutex> lk(mu_);
     for (;;) {
-        cvPop_.wait(lk, [this] { return stopping_.load() || !queue_.empty(); });
+        cvPop_.wait(lk, [this, workerIndex] {
+            return stopping_.load() || !queue_.empty() ||
+                   workerIndex >= (int)workerTarget_.load();
+        });
         if (stopping_.load()) return nullptr;
+        if (workerIndex >= (int)workerTarget_.load()) return nullptr;  // surplus
         if (!queue_.empty()) {
             auto job = queue_.front();
             queue_.pop_front();
@@ -362,9 +399,9 @@ std::shared_ptr<TransferQueue::Job> TransferQueue::popJob() {
     }
 }
 
-void TransferQueue::workerLoop(int /*workerIndex*/) {
+void TransferQueue::workerLoop(int workerIndex) {
     for (;;) {
-        std::shared_ptr<Job> job = popJob();
+        std::shared_ptr<Job> job = popJob(workerIndex);
         if (!job) return;
 
         if (job->state == TransferState::Canceled) {

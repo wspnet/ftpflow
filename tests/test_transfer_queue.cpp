@@ -575,6 +575,45 @@ int main() {
         std::remove(jpath.c_str());
     }
 
+    // ---- Part E: runtime worker resizing (offline, no server needed) ------
+    {
+        ftpflow::TransferQueue q(2, 100);
+        CHECK(q.workerCount() == 2);
+
+        // Grow: 2 -> 4.
+        q.setWorkers(4);
+        CHECK(q.workerCount() == 4);
+
+        // Shrink: 4 -> 1 (no jobs in flight, so surplus workers exit
+        // immediately and join).
+        q.setWorkers(1);
+        CHECK(q.workerCount() == 1);
+
+        // Clamp: 0 -> 1, and a huge value -> 64.
+        q.setWorkers(0);
+        CHECK(q.workerCount() == 1);
+        q.setWorkers(1000);
+        CHECK(q.workerCount() == 64);
+
+        // The queue still drains work after resizing (use a job that fails
+        // fast against a dead endpoint so no server is required).
+        ftpflow::TransferRequest req;
+        req.protocol = ftpflow::BackendKind::Sftp;
+        req.direction = ftpflow::TransferDirection::Upload;
+        req.localPath = "C:/Users/wspne/AppData/Local/Temp/tq_resize_src.bin";
+        req.remotePath = "/resize_dst.bin";
+        req.ssh.host = "127.0.0.1";
+        req.ssh.port = 1;   // nothing listens -> fails fast
+        req.ssh.user = "alice";
+        req.ssh.password = "x";
+        makeFiller(req.localPath, 64);   // small local source, fails fast
+        const std::uint64_t id = q.enqueue(req);
+        CHECK(id != 0);
+        q.waitAll();
+        CHECK(q.pending() == 0);
+        std::remove(req.localPath.c_str());
+    }
+
     std::printf("%d checks, %d failed\n", g_checks, g_failed);
     if (g_failed == 0) std::printf("ALL TRANSFER-QUEUE TESTS PASSED\n");
     return g_failed == 0 ? 0 : 1;

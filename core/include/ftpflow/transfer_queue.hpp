@@ -162,6 +162,15 @@ public:
     // Blocks until no job is queued or running.
     void waitAll();
 
+    // Number of transfer worker threads currently spawned.
+    unsigned workerCount() const;
+
+    // Adjust the number of workers at runtime. Growing spawns more threads
+    // immediately; shrinking lets the surplus workers finish their current
+    // job (if any) and then exit, blocking until they have joined. Bounds
+    // are clamped to [1, 64].
+    void setWorkers(unsigned n);
+
     void shutdown();
 
     std::size_t pending() const;   // queued + running
@@ -177,7 +186,7 @@ private:
     void workerLoop(int workerIndex);
     void runJob(Job* job);
     void emitEvent(const TransferEvent& ev);
-    std::shared_ptr<Job> popJob();
+    std::shared_ptr<Job> popJob(int workerIndex);
     bool allIdleLocked() const { return queue_.empty() && running_ == 0; }
 
     mutable std::mutex mu_;
@@ -191,6 +200,7 @@ private:
     unsigned running_ = 0;
     std::uint64_t nextId_ = 1;
     std::atomic<bool> stopping_{false};
+    std::atomic<unsigned> workerTarget_{0};   // desired worker count
 
     // Durable journal (optional). Written on enqueue, trimmed on terminal
     // states, replayed by restore(). See transfer_journal.hpp.

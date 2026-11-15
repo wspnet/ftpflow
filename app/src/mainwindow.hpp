@@ -20,6 +20,7 @@ class QTableView;
 class QSortFilterProxyModel;
 class QLabel;
 class QPushButton;
+class QSpinBox;
 
 namespace ftpflow {
 
@@ -83,6 +84,7 @@ private:
     QPushButton* pauseBtn_ = nullptr;
     QPushButton* cancelBtn_ = nullptr;
     QPushButton* clearDoneBtn_ = nullptr;
+    QSpinBox* workersSpin_ = nullptr;
 
     QLabel* statusLabel_ = nullptr;
 
