@@ -111,6 +111,11 @@ public:
     bool isOpen() const { return opened_; }
     void close();
 
+    // Human-readable cause of the most recent failed operation (empty
+    // after a success). Lets callers distinguish "empty listing" from
+    // "listing failed".
+    std::string lastError() const;
+
 private:
     struct Impl;
     Impl* impl_ = nullptr;

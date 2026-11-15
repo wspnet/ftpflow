@@ -166,7 +166,7 @@ std::size_t TransferQueue::pending() const {
     return queue_.size() + running_;
 }
 
-void TransferQueue::emit(const TransferEvent& ev) {
+void TransferQueue::emitEvent(const TransferEvent& ev) {
     EventCallback cb;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -209,7 +209,7 @@ void TransferQueue::workerLoop(int /*workerIndex*/) {
             fe.jobId = job->id;
             fe.kind = TransferEvent::Kind::Finished;
             fe.state = TransferState::Canceled;
-            emit(fe);
+            emitEvent(fe);
             continue;
         }
 
@@ -251,7 +251,7 @@ void TransferQueue::runJob(Job* job) {
     ev.mode = mode;
     ev.decision = decision;
     ev.state = TransferState::Running;
-    emit(ev);
+    emitEvent(ev);
 
     ProgressGate gate(progressMinIntervalMs_);
     TransferProgress tp;
@@ -268,7 +268,7 @@ void TransferQueue::runJob(Job* job) {
         pe.state = TransferState::Running;
         pe.mode = mode;
         pe.progress = tp;
-        emit(pe);
+        emitEvent(pe);
     };
 
     std::string error;
@@ -374,7 +374,7 @@ void TransferQueue::runJob(Job* job) {
     fe.progress = tp;
     fe.error = error;
     job->state = finalState;
-    emit(fe);
+    emitEvent(fe);
 }
 
 }  // namespace ftpflow

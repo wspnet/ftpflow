@@ -109,7 +109,7 @@ private:
 
     void workerLoop(int workerIndex);
     void runJob(Job* job);
-    void emit(const TransferEvent& ev);
+    void emitEvent(const TransferEvent& ev);
     std::shared_ptr<Job> popJob();
     bool allIdleLocked() const { return queue_.empty() && running_ == 0; }
 

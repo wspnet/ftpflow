@@ -297,6 +297,7 @@ ListingPage FtpSession::list(const std::string& dir) {
 
     std::string d = dir.empty() ? opt_.initialPath : dir;
     impl_->listBuf.clear();
+    impl_->lastErr.clear();
     ::curl_easy_setopt(impl_->easy, CURLOPT_URL, makeUrl(opt_, d, true).c_str());
     ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEFUNCTION, appendToString);
     ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEDATA, &impl_->listBuf);
@@ -447,6 +448,10 @@ void FtpSession::setProgressCallback(
     if (impl_) impl_->xfer.onProgress = std::move(fn);
 }
 
+std::string FtpSession::lastError() const {
+    return impl_ ? impl_->lastErr : std::string();
+}
+
 #else  // !FTPFLOW_HAVE_CURL
 
 struct FtpSession::Impl {};
@@ -485,6 +490,7 @@ FtpResult FtpSession::upload(const std::string&, const std::string&,
 
 void FtpSession::setProgressCallback(
         std::function<void(std::uint64_t, std::uint64_t)>) {}
+std::string FtpSession::lastError() const { return {}; }
 
 #endif
 

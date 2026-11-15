@@ -1,0 +1,315 @@
+// ftpflow -- remote filesystem table model implementation.
+#include "remote_fs_model.hpp"
+
+#include <QtCore/QDateTime>
+#include <QtCore/QMetaObject>
+
+#include <cstdio>
+
+namespace ftpflow {
+namespace {
+
+QString humanSize(std::uint64_t n) {
+    if (n < 1024) return QString::number(static_cast<qulonglong>(n)) + " B";
+    const double kb = n / 1024.0;
+    if (kb < 1024.0) return QString::number(kb, 'f', 1) + " KiB";
+    const double mb = kb / 1024.0;
+    if (mb < 1024.0) return QString::number(mb, 'f', 1) + " MiB";
+    return QString::number(mb / 1024.0, 'f', 2) + " GiB";
+}
+
+constexpr std::uint32_t kPageEntries = 500;
+
+}  // namespace
+
+RemoteFsModel::RemoteFsModel(QObject* parent)
+    : QAbstractTableModel(parent) {
+    worker_ = std::thread([this] { workerLoop(); });
+}
+
+RemoteFsModel::~RemoteFsModel() {
+    if (worker_.joinable()) {
+        pushTask(Task{Task::Kind::Shutdown});
+        worker_.join();
+    }
+}
+
+void RemoteFsModel::pushTask(Task t) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        tasks_.push_back(std::move(t));
+    }
+    cv_.notify_one();
+}
+
+// ---- public API (UI thread) ----------------------------------------------
+
+void RemoteFsModel::connectTo(const ConnInfo& ci) {
+    conn_ = ci;
+    currentPath_ = ci.startDir.empty() ? "/" : ci.startDir;
+    entries_.clear();
+    hasMore_ = false;
+    connected_ = false;
+    ++navGen_;
+
+    Task t;
+    t.kind = Task::Kind::Connect;
+    t.conn = ci;
+    t.generation = navGen_;
+    pushTask(std::move(t));
+}
+
+void RemoteFsModel::disconnect() {
+    connected_ = false;
+    entries_.clear();
+    ++navGen_;
+    pushTask(Task{Task::Kind::Disconnect});
+    beginResetModel();
+    endResetModel();
+    emit disconnected();
+}
+
+void RemoteFsModel::enterDir(const std::string& dir) {
+    currentPath_ = dir;
+    ++navGen_;
+
+    Task t;
+    t.kind = Task::Kind::List;
+    t.dir = dir;
+    t.generation = navGen_;
+    pushTask(std::move(t));
+    // Rows update when the listing lands; clear immediately so the old
+    // directory does not masquerade as the new one.
+    beginResetModel();
+    entries_.clear();
+    lastOfCurrentPage_.clear();
+    hasMore_ = false;
+    endResetModel();
+}
+
+void RemoteFsModel::goUp() {
+    if (currentPath_.empty() || currentPath_ == "/" ||
+        currentPath_ == ".") return;
+    const std::size_t slash = currentPath_.rfind('/');
+    if (slash == std::string::npos || slash == 0) {
+        enterDir("/");
+    } else {
+        enterDir(currentPath_.substr(0, slash));
+    }
+}
+
+void RemoteFsModel::refresh() {
+    if (!connected_) return;
+    enterDir(currentPath_);
+}
+
+std::string RemoteFsModel::joinRemote(const std::string& dir,
+                                      const std::string& name) const {
+    if (dir.empty() || dir == ".") return name;
+    if (dir.back() == '/') return dir + name;
+    return dir + "/" + name;
+}
+
+std::string RemoteFsModel::pathAt(const QModelIndex& idx) const {
+    if (!idx.isValid() || idx.row() >= static_cast<int>(entries_.size()))
+        return {};
+    return joinRemote(currentPath_, entryAt(idx.row()).name);
+}
+
+bool RemoteFsModel::isDir(const QModelIndex& idx) const {
+    if (!idx.isValid() || idx.row() >= static_cast<int>(entries_.size()))
+        return false;
+    return entryAt(idx.row()).type == EntryType::Directory;
+}
+
+// ---- model plumbing -------------------------------------------------------
+
+int RemoteFsModel::rowCount(const QModelIndex& parent) const {
+    if (parent.isValid()) return 0;
+    return static_cast<int>(entries_.size());
+}
+
+int RemoteFsModel::columnCount(const QModelIndex& parent) const {
+    if (parent.isValid()) return 0;
+    return ColCount;
+}
+
+QVariant RemoteFsModel::data(const QModelIndex& idx, int role) const {
+    if (!idx.isValid() || idx.row() >= static_cast<int>(entries_.size()))
+        return {};
+    const Entry& e = entryAt(idx.row());
+    if (role == Qt::TextAlignmentRole &&
+        (idx.column() == ColSize || idx.column() == ColModified))
+        return int(Qt::AlignRight | Qt::AlignVCenter);
+    if (role != Qt::DisplayRole) return {};
+
+    switch (idx.column()) {
+        case ColName:
+            return QString::fromStdString(e.name);
+        case ColSize:
+            return e.type == EntryType::Directory
+                ? QString("<dir>") : humanSize(e.size);
+        case ColModified:
+            return e.mtimeUnix == 0
+                ? QString("-")
+                : QDateTime::fromSecsSinceEpoch(e.mtimeUnix)
+                      .toString("yyyy-MM-dd HH:mm");
+    }
+    return {};
+}
+
+QVariant RemoteFsModel::headerData(int section, Qt::Orientation o,
+                                   int role) const {
+    if (o != Qt::Horizontal || role != Qt::DisplayRole) return {};
+    switch (section) {
+        case ColName: return "名称";
+        case ColSize: return "大小";
+        case ColModified: return "修改时间";
+    }
+    return {};
+}
+
+bool RemoteFsModel::canFetchMore(const QModelIndex& parent) const {
+    if (parent.isValid()) return false;
+    return hasMore_ && connected_;
+}
+
+void RemoteFsModel::fetchMore(const QModelIndex& parent) {
+    if (parent.isValid() || !canFetchMore(parent)) return;
+    Task t;
+    t.kind = Task::Kind::List;
+    t.dir = currentPath_;
+    t.startAfter = lastOfCurrentPage_;   // SFTP cursor; FTP ignores it
+    t.generation = navGen_;
+    pushTask(std::move(t));
+}
+
+// ---- worker thread --------------------------------------------------------
+
+void RemoteFsModel::workerLoop() {
+    std::unique_ptr<FtpSession> ftp;
+    std::unique_ptr<SftpSession> sftp;
+
+    for (;;) {
+        Task t;
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [this] { return !tasks_.empty(); });
+            t = std::move(tasks_.front());
+            tasks_.pop_front();
+        }
+        if (t.kind == Task::Kind::Shutdown) return;
+
+        if (t.kind == Task::Kind::Disconnect) {
+            ftp.reset();
+            sftp.reset();
+            continue;
+        }
+
+        if (t.kind == Task::Kind::Connect) {
+            ftp.reset();
+            sftp.reset();
+            std::string error;
+            if (t.conn.isSftp) {
+                auto s = std::make_unique<SftpSession>(HostKeyPolicy::AcceptNew);
+                std::string acceptedKey;
+                SftpResult r = s->open(t.conn.ssh, {}, &acceptedKey);
+                if (!r.ok()) {
+                    error = "SFTP 连接失败: " + r.message;
+                } else {
+                    sftp = std::move(s);
+                }
+            } else {
+                auto f = std::make_unique<FtpSession>();
+                FtpResult r = f->open(t.conn.ftp);
+                if (!r.ok()) {
+                    error = "FTP 连接失败: " + r.message;
+                } else {
+                    ftp = std::move(f);
+                }
+            }
+            // Post the connect result, then (on success) the first listing.
+            QMetaObject::invokeMethod(
+                this,
+                [this, error] {
+                    if (error.empty()) {
+                        connected_ = true;
+                        emit connected();
+                    } else {
+                        connected_ = false;
+                        emit connectFailed(QString::fromStdString(error));
+                    }
+                },
+                Qt::QueuedConnection);
+            if (!error.empty()) continue;
+            // Fall through to listing startDir.
+            t.kind = Task::Kind::List;
+            t.dir = t.conn.startDir;
+        }
+
+        // List.
+        std::vector<Entry> entries;
+        bool hasMore = false;
+        std::string error;
+        ListingPage page;
+        if (sftp) {
+            page = sftp->list(t.dir, t.startAfter, kPageEntries);
+            error = sftp->lastError();      // "" on success
+            entries = std::move(page.entries);
+            hasMore = page.hasMore;
+        } else if (ftp) {
+            page = ftp->list(t.dir);
+            error = ftp->lastError();       // "" on success (also for empty)
+            entries = std::move(page.entries);
+            hasMore = false;                // whole listing in one page
+        } else {
+            error = "会话未连接";
+        }
+
+        QMetaObject::invokeMethod(
+            this,
+            [this, gen = t.generation, dir = t.dir,
+             entries = std::move(entries), hasMore, error]() mutable {
+                postListing(gen, dir, std::move(entries), hasMore, error);
+            },
+            Qt::QueuedConnection);
+    }
+}
+
+void RemoteFsModel::postListing(std::uint64_t generation,
+                                const std::string& dir,
+                                std::vector<Entry> entries, bool hasMore,
+                                const std::string& error) {
+    // Stale result (the user navigated again meanwhile)?
+    if (generation != navGen_) return;
+
+    if (!error.empty()) {
+        emit browseFailed(QString::fromStdString(error));
+        return;
+    }
+
+    const bool appending = !lastOfCurrentPage_.empty();
+    if (!appending) {
+        beginResetModel();
+        entries_ = std::move(entries);
+        lastOfCurrentPage_ = entries_.empty() ? std::string()
+                                              : entries_.back().name;
+        hasMore_ = hasMore;
+        endResetModel();
+    } else {
+        if (entries.empty()) {
+            hasMore_ = false;
+            return;
+        }
+        const int first = static_cast<int>(entries_.size());
+        beginInsertRows({}, first, first + static_cast<int>(entries.size()) - 1);
+        for (Entry& e : entries) {
+            entries_.push_back(std::move(e));
+            lastOfCurrentPage_ = entries_.back().name;
+        }
+        hasMore_ = hasMore;
+        endInsertRows();
+    }
+}
+
+}  // namespace ftpflow

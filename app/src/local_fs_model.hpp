@@ -49,6 +49,8 @@ public:
 
     std::string root() const { return root_; }
     std::string currentDir() const { return currentDir_; }
+    // Absolute path of the directory on screen (root + currentDir).
+    std::string currentDirFullPath() const { return currentFullPath(); }
     QString pathAt(const QModelIndex& idx) const;
     std::string relativeAt(const QModelIndex& idx) const;
     bool isDir(const QModelIndex& idx) const;

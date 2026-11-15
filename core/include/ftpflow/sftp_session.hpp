@@ -120,6 +120,9 @@ public:
     bool isOpen() const { return state_ == State::Open; }
     void close();
 
+    // Cause of the most recent failed operation ("" after success).
+    std::string lastError() const;
+
 private:    struct Impl;
     enum class State : std::uint8_t { Idle, Open, Closed };
     Impl* impl_ = nullptr;

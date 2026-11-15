@@ -32,6 +32,7 @@ struct SftpSession::Impl {
 
     std::function<void(std::uint64_t, std::uint64_t)> onProgress;
     std::uint64_t progressTotal = 0;   // set per transfer by the caller side
+    std::string lastErr;               // most recent failure text
 
     static std::string hexOf(const unsigned char* p, std::size_t n) {
         static const char* kHex = "0123456789abcdef";
@@ -230,7 +231,9 @@ ListingPage SftpSession::list(const std::string& dir,
                               const std::string& startAfter,
                               std::uint32_t maxEntries) {
     ListingPage page;
+    if (impl_) impl_->lastErr.clear();
     if (state_ != State::Open || !impl_->sftp) {
+        if (impl_) impl_->lastErr = "session not open";
         page.cursor = "session-not-open";
         return page;
     }
@@ -241,8 +244,9 @@ ListingPage SftpSession::list(const std::string& dir,
         waitSocket(impl_->sock, false, 5000);
     }
     if (!h) {
-        SftpResult r = mapSshErr(classifySftpErr(impl_->sftp), ("opendir " + dir).c_str(),
-                                 impl_->session);
+        SftpResult r = mapSshErr(classifySftpErr(impl_->sftp),
+                                 ("opendir " + dir).c_str(), impl_->session);
+        impl_->lastErr = r.message;
         page.cursor = r.message;
         return page;
     }
@@ -495,6 +499,10 @@ void SftpSession::setProgressCallback(
     impl_->onProgress = std::move(fn);
 }
 
+std::string SftpSession::lastError() const {
+    return impl_ ? impl_->lastErr : std::string();
+}
+
 SftpResult SftpSession::mkdir(const std::string& remotePath, std::uint32_t mode) {
     if (state_ != State::Open || !impl_->sftp) {
         return {SftpStatus::IoError, "session not open"};
@@ -632,6 +640,7 @@ SftpResult SftpSession::upload(const std::string&, const std::string&,
 }
 void SftpSession::setProgressCallback(
         std::function<void(std::uint64_t, std::uint64_t)>) {}
+std::string SftpSession::lastError() const { return {}; }
 SftpResult SftpSession::mkdir(const std::string&, std::uint32_t) {
     return {SftpStatus::EngineUnavailable, "built without libssh2"};
 }
