@@ -523,6 +523,20 @@ std::string SftpSession::lastError() const {
     return impl_ ? impl_->lastErr : std::string();
 }
 
+bool SftpSession::connectionLost() const {
+    if (!impl_ || !impl_->session) return false;
+    const int err = libssh2_session_last_errno(impl_->session);
+    switch (err) {
+        case LIBSSH2_ERROR_SOCKET_DISCONNECT:  // -13
+        case LIBSSH2_ERROR_SOCKET_SEND:        // -7
+        case LIBSSH2_ERROR_SOCKET_RECV:        // -43
+        case LIBSSH2_ERROR_SOCKET_TIMEOUT:     // -30
+            return true;
+        default:
+            return false;
+    }
+}
+
 SftpResult SftpSession::mkdir(const std::string& remotePath, std::uint32_t mode) {
     if (state_ != State::Open || !impl_->sftp) {
         return {SftpStatus::IoError, "session not open"};
@@ -679,6 +693,7 @@ SftpResult SftpSession::upload(const std::string&, const std::string&,
 void SftpSession::setProgressCallback(
         std::function<void(std::uint64_t, std::uint64_t)>) {}
 std::string SftpSession::lastError() const { return {}; }
+bool SftpSession::connectionLost() const { return false; }
 SftpResult SftpSession::mkdir(const std::string&, std::uint32_t) {
     return {SftpStatus::EngineUnavailable, "built without libssh2"};
 }

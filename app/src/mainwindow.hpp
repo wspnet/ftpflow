@@ -21,6 +21,7 @@ class QSortFilterProxyModel;
 class QLabel;
 class QPushButton;
 class QSpinBox;
+class QTimer;
 
 namespace ftpflow {
 
@@ -45,6 +46,7 @@ private slots:
     void onRemoteBrowseFailed(const QString& msg);
     void onRemoteOpFailed(const QString& msg);
     void onRemoteContextMenu(const QPoint& pos);
+    void onConnectionLost(const QString& msg);
     void onHostKeyUnknown(const QString& fingerprint, const QString& host,
                           quint16 port, const QString& keyHex);
 
@@ -87,6 +89,9 @@ private:
     QSpinBox* workersSpin_ = nullptr;
 
     QLabel* statusLabel_ = nullptr;
+
+    // One-shot reconnect attempt after the remote transport drops.
+    QTimer* reconnectTimer_ = nullptr;
 
     std::unique_ptr<TransferQueue> queue_;
     std::map<std::uint64_t, QListWidgetItem*> transferItems_;

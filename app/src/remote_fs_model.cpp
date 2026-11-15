@@ -439,14 +439,26 @@ void RemoteFsModel::workerLoop() {
                     error = "会话未连接";
                 }
             }
+            // A dropped transport is a connection loss, not an op failure.
+            const bool lost = !error.empty() &&
+                ((sftp && sftp->connectionLost()) ||
+                 (ftp && ftp->connectionLost()));
             QMetaObject::invokeMethod(
                 this,
-                [this, error] {
+                [this, error, lost] {
                     if (error.empty()) emit opFinished({});
-                    else emit opFailed(QString::fromStdString(error));
+                    else if (lost) {
+                        connected_ = false;
+                        emit connectionLost(QString::fromStdString(error));
+                    } else {
+                        emit opFailed(QString::fromStdString(error));
+                    }
                 },
                 Qt::QueuedConnection);
-            if (!error.empty()) continue;
+            if (!error.empty()) {
+                if (lost) { sftp.reset(); ftp.reset(); }
+                continue;
+            }
             // Success: relist the directory the op happened in.
             t.kind = Task::Kind::List;
             t.startAfter.clear();
@@ -458,19 +470,37 @@ void RemoteFsModel::workerLoop() {
         std::vector<Entry> entries;
         bool hasMore = false;
         std::string error;
+        bool lost = false;
         ListingPage page;
         if (sftp) {
             page = sftp->list(t.dir, t.startAfter, kPageEntries);
             error = sftp->lastError();      // "" on success
             entries = std::move(page.entries);
             hasMore = page.hasMore;
+            if (!error.empty() && sftp->connectionLost()) lost = true;
         } else if (ftp) {
             page = ftp->list(t.dir);
             error = ftp->lastError();       // "" on success (also for empty)
             entries = std::move(page.entries);
             hasMore = false;                // whole listing in one page
+            if (!error.empty() && ftp->connectionLost()) lost = true;
         } else {
             error = "会话未连接";
+        }
+
+        // A dropped transport is a different signal from a failed browse:
+        // close the dead session and let the UI decide to reconnect.
+        if (lost) {
+            sftp.reset();
+            ftp.reset();
+            QMetaObject::invokeMethod(
+                this,
+                [this, error] {
+                    connected_ = false;
+                    emit connectionLost(QString::fromStdString(error));
+                },
+                Qt::QueuedConnection);
+            continue;
         }
 
         QMetaObject::invokeMethod(

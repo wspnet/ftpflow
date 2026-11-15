@@ -125,6 +125,12 @@ public:
     bool isOpen() const { return state_ == State::Open; }
     void close();
 
+    // True when the most recent failed operation was caused by the transport
+    // dropping (socket disconnect/send/recv/timeout) rather than a protocol-
+    // level or business error. Used by the GUI to distinguish "session died"
+    // (-> auto-reconnect) from "operation failed" (-> just report).
+    bool connectionLost() const;
+
     // Cause of the most recent failed operation ("" after success).
     std::string lastError() const;
 

@@ -193,6 +193,7 @@ struct FtpSession::Impl {
     char errBuf[CURL_ERROR_SIZE] = {0};
     std::string lastErr;
     std::string listBuf;
+    int lastCurlErr = CURLE_OK;   // most recent curl result code
     XferCtx xfer;   // progress/control state shared with the XFERINFO hook
 };
 
@@ -306,6 +307,7 @@ ListingPage FtpSession::list(const std::string& dir) {
     ::curl_easy_setopt(impl_->easy, CURLOPT_DIRLISTONLY, 0L);
     CURLcode rc = ::curl_easy_perform(impl_->easy);
     if (rc != CURLE_OK) {
+        impl_->lastCurlErr = (int)rc;
         impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
         impl_->lastErr = *impl_->errBuf ? impl_->errBuf
                                         : ::curl_easy_strerror(rc);
@@ -473,12 +475,14 @@ FtpResult FtpSession::quoteCommand(const std::string& cmd) {
     ::curl_easy_setopt(impl_->easy, CURLOPT_QUOTE, nullptr);
     ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 0L);
     if (rc != CURLE_OK) {
+        impl_->lastCurlErr = (int)rc;
         impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
         impl_->lastErr = *impl_->errBuf ? impl_->errBuf
                                         : ::curl_easy_strerror(rc);
         impl_->lastErr = cmd.substr(0, cmd.find(' ')) + ": " + impl_->lastErr;
         return {FtpStatus::IoError, impl_->lastErr, rc};
     }
+    impl_->lastCurlErr = CURLE_OK;
     return {};
 }
 #endif
@@ -526,12 +530,14 @@ FtpResult FtpSession::rename(const std::string& from, const std::string& to) {
     ::curl_easy_setopt(impl_->easy, CURLOPT_QUOTE, nullptr);
     ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 0L);
     if (rc != CURLE_OK) {
+        impl_->lastCurlErr = (int)rc;
         impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
         impl_->lastErr = *impl_->errBuf ? impl_->errBuf
                                         : ::curl_easy_strerror(rc);
         impl_->lastErr = "rename: " + impl_->lastErr;
         return {FtpStatus::IoError, impl_->lastErr, rc};
     }
+    impl_->lastCurlErr = CURLE_OK;
     return {};
 #else
     return {FtpStatus::EngineUnavailable, "built without libcurl"};
@@ -540,6 +546,18 @@ FtpResult FtpSession::rename(const std::string& from, const std::string& to) {
 
 std::string FtpSession::lastError() const {
     return impl_ ? impl_->lastErr : std::string();
+}
+
+bool FtpSession::connectionLost() const {
+    if (!impl_) return false;
+    switch (impl_->lastCurlErr) {
+        case CURLE_RECV_ERROR:          // 56 - failure receiving network data
+        case CURLE_SEND_ERROR:          // 55 - failed sending network data
+        case CURLE_OPERATION_TIMEDOUT:  // 28 - transfer stalled
+            return true;
+        default:
+            return false;
+    }
 }
 
 #else  // !FTPFLOW_HAVE_CURL
@@ -581,6 +599,7 @@ FtpResult FtpSession::upload(const std::string&, const std::string&,
 void FtpSession::setProgressCallback(
         std::function<void(std::uint64_t, std::uint64_t)>) {}
 std::string FtpSession::lastError() const { return {}; }
+bool FtpSession::connectionLost() const { return false; }
 
 #endif
 

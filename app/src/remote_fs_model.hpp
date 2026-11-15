@@ -90,6 +90,9 @@ signals:
     void disconnected();
     void opFinished(const QString& message);
     void opFailed(const QString& message);
+    // Emitted when the remote transport dropped mid-session (socket error),
+    // as opposed to a business/protocol error. The UI can auto-reconnect.
+    void connectionLost(const QString& message);
     // Emitted on strict host-key rejection: carry the standard SHA256
     // fingerprint and the observed blob hex for a trust-on-first-use prompt.
     void hostKeyUnknown(const QString& fingerprint, const QString& host,

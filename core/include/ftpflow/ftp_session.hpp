@@ -119,6 +119,12 @@ public:
     bool isOpen() const { return opened_; }
     void close();
 
+    // True when the most recent failed operation was a transport drop
+    // (CURLE_RECV_ERROR / CURLE_SEND_ERROR) rather than a server-side or
+    // business error. Mirrors SftpSession::connectionLost() for the GUI's
+    // auto-reconnect decision.
+    bool connectionLost() const;
+
     // Human-readable cause of the most recent failed operation (empty
     // after a success). Lets callers distinguish "empty listing" from
     // "listing failed".

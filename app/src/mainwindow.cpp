@@ -18,6 +18,7 @@
 #include <QSplitter>
 #include <QStatusBar>
 #include <QTableView>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -106,6 +107,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                 8000);
         }
     }
+
+    // One-shot reconnect after a transport drop.
+    reconnectTimer_ = new QTimer(this);
+    reconnectTimer_->setSingleShot(true);
+    connect(reconnectTimer_, &QTimer::timeout, this, [this] {
+        const auto ci = remote_->connInfo();
+        remotePathEdit_->setText("重连中...");
+        remote_->connectTo(ci);
+    });
 }
 
 MainWindow::~MainWindow() {
@@ -244,6 +254,8 @@ void MainWindow::buildUi() {
             &MainWindow::onRemoteBrowseFailed);
     connect(remote_, &RemoteFsModel::opFailed, this,
             &MainWindow::onRemoteOpFailed);
+    connect(remote_, &RemoteFsModel::connectionLost, this,
+            &MainWindow::onConnectionLost);
     // Right-click: remote file operations.
     rightTable_->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(rightTable_, &QTableView::customContextMenuRequested, this,
@@ -397,12 +409,14 @@ void MainWindow::onConnect() {
 }
 
 void MainWindow::onDisconnect() {
+    reconnectTimer_->stop();
     remote_->disconnect();
     connectBtn_->setEnabled(true);
     disconnectBtn_->setEnabled(false);
 }
 
 void MainWindow::onRemoteConnected() {
+    reconnectTimer_->stop();
     connectBtn_->setEnabled(false);
     disconnectBtn_->setEnabled(true);
     remotePathEdit_->setText(QString::fromStdString(remote_->currentPath()));
@@ -442,6 +456,17 @@ void MainWindow::onHostKeyUnknown(const QString& fingerprint,
 
 void MainWindow::onRemoteBrowseFailed(const QString& msg) {
     statusBar()->showMessage(msg, 8000);
+}
+
+void MainWindow::onConnectionLost(const QString& msg) {
+    // The remote transport dropped. Show the cause and schedule a one-shot
+    // reconnect (reusing the saved connection info). If it fails, the normal
+    // connectFailed path restores the "未连接" UI for a manual retry.
+    disconnectBtn_->setEnabled(false);
+    remotePathEdit_->setText("连接已断开，准备重连...");
+    statusBar()->showMessage(
+        QString("连接已断开：%1（自动重连中...）").arg(msg), 8000);
+    reconnectTimer_->start(1500);
 }
 
 void MainWindow::onRemoteUp() {
