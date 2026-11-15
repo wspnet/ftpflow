@@ -148,7 +148,7 @@ void MainWindow::buildUi() {
     auto* leftLay = new QVBoxLayout(leftPane);
     leftLay->setContentsMargins(0, 0, 0, 0);
     auto* leftTitle = new QLabel("本地", leftPane);
-    leftTitle->setStyleSheet("font-weight: bold; padding: 2px;");
+    leftTitle->setObjectName("paneTitle");
     model_ = new LocalFsModel(this);
     proxy_ = new QSortFilterProxyModel(this);
     proxy_->setSourceModel(model_);
@@ -181,6 +181,10 @@ void MainWindow::buildUi() {
     arrowLay->addStretch(1);
     auto* uploadBtn = new QPushButton("上传 →", arrows);
     auto* downloadBtn = new QPushButton("← 下载", arrows);
+    uploadBtn->setProperty("accent", true);
+    downloadBtn->setProperty("accent", true);
+    uploadBtn->setMinimumWidth(88);
+    downloadBtn->setMinimumWidth(88);
     arrowLay->addWidget(uploadBtn);
     arrowLay->addWidget(downloadBtn);
     arrowLay->addStretch(1);
@@ -194,7 +198,7 @@ void MainWindow::buildUi() {
     auto* rightLay = new QVBoxLayout(rightPane);
     rightLay->setContentsMargins(0, 0, 0, 0);
     auto* rightTitle = new QLabel("远端", rightPane);
-    rightTitle->setStyleSheet("font-weight: bold; padding: 2px;");
+    rightTitle->setObjectName("paneTitle");
     auto* remoteBar = new QWidget(rightPane);
     auto* remoteBarLay = new QHBoxLayout(remoteBar);
     remoteBarLay->setContentsMargins(2, 0, 2, 0);
