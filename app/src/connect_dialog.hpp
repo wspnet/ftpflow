@@ -9,6 +9,8 @@
 class QComboBox;
 class QFileDialog;
 class QLineEdit;
+class QTreeWidget;
+class QTreeWidgetItem;
 
 namespace ftpflow {
 
@@ -28,15 +30,24 @@ public:
 private slots:
     void onProtocolChanged(int index);
     void onBrowseKey();
-    void onSiteChosen(int index);
+    void onSiteChosen(QTreeWidgetItem* current, QTreeWidgetItem* previous);
+    void onFilterChanged(const QString& text);
     void onSaveSite();
+    void onDeleteSite();
+    void onExportSites();
+    void onImportSites();
 
 private:
     void buildUi();
+    void rebuildSiteTree(const QString& filter = QString());
+    // Append a site leaf under its group top-level node (created on demand).
+    QTreeWidgetItem* ensureGroup(const QString& group);
 
     SiteStore* store_ = nullptr;
-    QComboBox* site_ = nullptr;
+    QLineEdit* filter_ = nullptr;
+    QTreeWidget* tree_ = nullptr;
     QPushButton* saveSiteBtn_ = nullptr;
+    QPushButton* deleteSiteBtn_ = nullptr;
     QComboBox* proto_ = nullptr;
     QLineEdit* host_ = nullptr;
     QLineEdit* port_ = nullptr;
@@ -45,6 +56,7 @@ private:
     QLineEdit* keyPath_ = nullptr;
     QLineEdit* startDir_ = nullptr;
     QLineEdit* pushCmd_ = nullptr;
+    QLineEdit* group_ = nullptr;
     QPushButton* browseKeyBtn_ = nullptr;
 };
 

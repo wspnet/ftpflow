@@ -12,7 +12,10 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSet>
 #include <QStandardPaths>
+
+#include <algorithm>
 
 #include <wincred.h>
 
@@ -33,6 +36,7 @@ SiteEntry fromJson(const QJsonObject& o) {
     e.keyPath = o.value("keyPath").toString();
     e.startDir = o.value("startDir").toString();
     e.pushCmd = o.value("pushCmd").toString();
+    e.group = o.value("group").toString();
     return e;
 }
 
@@ -46,6 +50,7 @@ QJsonObject toJson(const SiteEntry& e) {
     if (!e.keyPath.isEmpty()) o.insert("keyPath", e.keyPath);
     if (!e.startDir.isEmpty()) o.insert("startDir", e.startDir);
     if (!e.pushCmd.isEmpty()) o.insert("pushCmd", e.pushCmd);
+    if (!e.group.isEmpty()) o.insert("group", e.group);
     return o;
 }
 
@@ -101,6 +106,66 @@ void SiteStore::remove(const QString& name) {
             return;
         }
     }
+}
+
+QList<QString> SiteStore::groups() const {
+    QSet<QString> seen;
+    for (const SiteEntry& e : sites_) {
+        if (!e.group.isEmpty()) seen.insert(e.group);
+    }
+    QList<QString> out = seen.values();
+    std::sort(out.begin(), out.end(),
+              [](const QString& a, const QString& b) {
+                  return a.localeAwareCompare(b) < 0;
+              });
+    return out;
+}
+
+QList<SiteEntry> SiteStore::sitesInGroup(const QString& group) const {
+    QList<SiteEntry> out;
+    for (const SiteEntry& e : sites_) {
+        if (e.group == group) out.push_back(e);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const SiteEntry& a, const SiteEntry& b) {
+                  return a.name.localeAwareCompare(b.name) < 0;
+              });
+    return out;
+}
+
+bool SiteStore::exportTo(const QString& path, QString* error) const {
+    QJsonArray arr;
+    for (const SiteEntry& e : sites_) arr.append(toJson(e));
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (error) *error = QString("无法写入 %1").arg(path);
+        return false;
+    }
+    f.write(QJsonDocument(arr).toJson(QJsonDocument::Indented));
+    return true;
+}
+
+bool SiteStore::importFrom(const QString& path, QString* error) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        if (error) *error = QString("无法读取 %1").arg(path);
+        return false;
+    }
+    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+    if (!doc.isArray()) {
+        if (error) *error = QString("%1 不是有效的站点文件").arg(path);
+        return false;
+    }
+    int added = 0;
+    for (const QJsonValue& v : doc.array()) {
+        if (!v.isObject()) continue;
+        const SiteEntry e = fromJson(v.toObject());
+        if (e.name.isEmpty() || e.host.isEmpty()) continue;
+        upsert(e);   // merge by name (replace existing)
+        ++added;
+    }
+    if (error && added == 0) *error = "文件中没有可导入的站点";
+    return added > 0;
 }
 
 QString SiteStore::readPassword(const QString& siteName) {

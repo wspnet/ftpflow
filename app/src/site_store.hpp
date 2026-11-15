@@ -18,6 +18,7 @@ struct SiteEntry {
     QString keyPath;        // PEM private key file (path only)
     QString startDir;
     QString pushCmd;        // remote decompressor template (optional)
+    QString group;          // grouping label ("" = ungrouped), XTerminal-style
     // Transient: filled from Credential Manager, never serialized.
     QString password;
 };
@@ -34,6 +35,16 @@ public:
     // Insert or replace by name.
     void upsert(const SiteEntry& site);
     void remove(const QString& name);
+
+    // Grouping (XTerminal-style multi-level organization).
+    QList<QString> groups() const;              // sorted, deduped, "" excluded
+    QList<SiteEntry> sitesInGroup(const QString& group) const;  // "" = ungrouped
+
+    // Import / export the full site list (JSON). Passwords are NOT included
+    // (they live in the OS Credential Manager); export only emits metadata.
+    bool exportTo(const QString& path, QString* error) const;
+    // Merge import: existing entries with the same name are replaced.
+    bool importFrom(const QString& path, QString* error);
 
     // ---- Windows Credential Manager --------------------------------------
     static QString readPassword(const QString& siteName);
