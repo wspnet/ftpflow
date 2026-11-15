@@ -38,6 +38,7 @@ public:
         SshEndpoint ssh;              // when isSftp
         std::string startDir;         // remote initial directory
         std::string pushCmdTemplate;  // SSH compress agent template (opt)
+        std::string siteName;         // saved-site reference (cred recovery)
     };
 
     explicit RemoteFsModel(QObject* parent = nullptr);

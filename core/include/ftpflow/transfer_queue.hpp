@@ -34,6 +34,8 @@
 
 namespace ftpflow {
 
+class TransferJournal;   // defined in transfer_journal.hpp (includes us)
+
 enum class TransferState : std::uint8_t {
     Queued, Running, Done, Failed, Canceled,
 };
@@ -79,6 +81,11 @@ struct TransferRequest {
     // an already-existing dir are ignored). Downloads always create the
     // local parent directory chain.
     bool ensureRemoteDir = false;
+
+    // Saved-site reference for credential recovery on restore (GUI). The
+    // journal stores it; restore() users match it against their site store
+    // to re-supply the password/key. Empty = inline credentials (CLI).
+    std::string siteName;
 };
 
 struct TransferEvent {
@@ -108,6 +115,21 @@ public:
     // Must be set before the first enqueue (events fire on worker threads;
     // the callback must be thread-safe or marshal to another thread).
     void setEventCallback(EventCallback cb);
+
+    // Attach a durable journal (by file path; empty disables it). Queued /
+    // running jobs are written on enqueue and removed on a terminal state;
+    // restore() replays them. Credentials are NOT persisted (the journal
+    // drops passwords/keys) -- supply them again on restore via
+    // setCredentialSource or by editing the restored requests.
+    void setJournal(std::string journalPath);
+
+    // Recovers in-flight jobs from the journal and re-enqueues them with
+    // resume=true (byte-exact continuation). Returns the number restored.
+    // Credentials for the restored jobs come from `cred` when set (applied
+    // to every restored request). Must be called before any worker has
+    // work, ideally right after construction.
+    std::size_t restore(std::string* error = nullptr,
+                        std::function<void(TransferRequest&)> cred = nullptr);
 
     std::uint64_t enqueue(TransferRequest req);   // -> jobId (1-based)
 
@@ -163,6 +185,11 @@ private:
     unsigned running_ = 0;
     std::uint64_t nextId_ = 1;
     std::atomic<bool> stopping_{false};
+
+    // Durable journal (optional). Written on enqueue, trimmed on terminal
+    // states, replayed by restore(). See transfer_journal.hpp.
+    std::unique_ptr<TransferJournal> journal_;
+    mutable std::mutex journalMu_;   // serializes journal load-modify-save
 };
 
 }  // namespace ftpflow

@@ -11,6 +11,7 @@
 #include <memory>
 #include <sys/stat.h>
 
+#include "ftpflow/transfer_journal.hpp"
 #include "ftpflow/tree_walk.hpp"
 
 namespace ftpflow {
@@ -160,17 +161,58 @@ void TransferQueue::setEventCallback(EventCallback cb) {
     onEvent_ = std::move(cb);
 }
 
+void TransferQueue::setJournal(std::string journalPath) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (journalPath.empty()) {
+        journal_.reset();
+    } else {
+        journal_ = std::make_unique<TransferJournal>(std::move(journalPath));
+    }
+}
+
+std::size_t TransferQueue::restore(
+        std::string* error, std::function<void(TransferRequest&)> cred) {
+    if (!journal_ || !journal_->enabled()) return 0;
+    std::vector<JournalRecord> recs;
+    std::string err;
+    if (!journal_->load(recs, &err)) {
+        if (error) *error = err;
+        return 0;
+    }
+    std::size_t restored = 0;
+    for (const JournalRecord& rec : recs) {
+        TransferRequest req = TransferJournal::toRequest(rec);
+        req.resume = true;              // byte-exact continuation
+        if (cred) cred(req);
+        if (enqueue(std::move(req)) != 0) ++restored;
+    }
+    return restored;
+}
+
 std::uint64_t TransferQueue::enqueue(TransferRequest req) {
     auto job = std::make_shared<Job>();
     job->req = std::move(req);
     std::uint64_t id = 0;
+    TransferRequest snapshot;   // copy for the journal (req is moved below)
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (stopping_.load()) return 0;
         id = nextId_++;
         job->id = id;
+        snapshot = job->req;
         all_.push_back(job);
         queue_.push_back(std::move(job));
+    }
+    // Persist BEFORE waking a worker, so the journal is complete by the
+    // time the job can reach a terminal state and be trimmed.
+    if (journal_ && journal_->enabled()) {
+        std::lock_guard<std::mutex> lk(journalMu_);
+        std::vector<JournalRecord> recs;
+        std::string err;
+        if (journal_->load(recs, &err)) {
+            recs.push_back(TransferJournal::fromRequest(id, snapshot));
+            journal_->save(recs, &err);
+        }
     }
     cvPop_.notify_one();
     return id;
@@ -329,6 +371,11 @@ void TransferQueue::workerLoop(int /*workerIndex*/) {
             fe.kind = TransferEvent::Kind::Finished;
             fe.state = TransferState::Canceled;
             emitEvent(fe);
+            if (journal_ && journal_->enabled()) {
+                std::lock_guard<std::mutex> lk(journalMu_);
+                std::string jerr;
+                journal_->remove(job->id, &jerr);
+            }
             continue;
         }
 
@@ -711,6 +758,13 @@ void TransferQueue::runJob(Job* job) {
     fe.error = error;
     job->state = finalState;
     emitEvent(fe);
+
+    // Trim the journal: a terminal job is no longer resumable.
+    if (journal_ && journal_->enabled()) {
+        std::lock_guard<std::mutex> lk(journalMu_);
+        std::string jerr;
+        journal_->remove(job->id, &jerr);
+    }
 }
 
 }  // namespace ftpflow

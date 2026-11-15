@@ -22,7 +22,10 @@
 
 #include "connect_dialog.hpp"
 #include "ftpflow/protocol_status.hpp"
+#include "ftpflow/transfer_journal.hpp"
 #include "ftpflow/version.hpp"
+
+#include <fstream>
 
 namespace ftpflow {
 
@@ -34,6 +37,13 @@ QString humanSpeed(double bps) {
     if (bps < 1024.0 * 1024.0)
         return QString::number(bps / 1024.0, 'f', 1) + " KiB/s";
     return QString::number(bps / (1024.0 * 1024.0), 'f', 2) + " MiB/s";
+}
+
+std::string readKeyFile(const QString& path) {
+    std::ifstream f(path.toStdString(), std::ios::binary);
+    if (!f) return {};
+    return {std::istreambuf_iterator<char>(f),
+            std::istreambuf_iterator<char>()};
 }
 
 }  // namespace
@@ -51,6 +61,43 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         QMetaObject::invokeMethod(
             this, [this, ev] { onTransferEvent(ev); }, Qt::QueuedConnection);
     });
+
+    // Durable journal: resume in-flight transfers after a restart. The
+    // journal drops credentials; re-supply them from the saved site.
+    queue_->setJournal(TransferJournal::defaultPath());
+    {
+        std::string terr;
+        const std::size_t restored = queue_->restore(&terr,
+            [this](TransferRequest& r) {
+                if (r.siteName.empty()) return;
+                const QString name = QString::fromStdString(r.siteName);
+                for (const SiteEntry& e : siteStore_.sites()) {
+                    if (e.name != name) continue;
+                    const SiteEntry full = siteStore_.withPassword(e);
+                    r.ssh.host = e.host.toStdString();
+                    r.ssh.port = (std::uint16_t)e.port;
+                    r.ssh.user = e.user.toStdString();
+                    r.ssh.password = full.password.toStdString();
+                    if (!e.keyPath.isEmpty())
+                        r.ssh.privateKeyPem = readKeyFile(e.keyPath);
+                    r.ftp.host = r.ssh.host;
+                    r.ftp.port = r.ssh.port;
+                    r.ftp.user = r.ssh.user;
+                    r.ftp.password = r.ssh.password;
+                    r.pushCommandTemplate = e.pushCmd.toStdString();
+                    break;
+                }
+            });
+        if (restored > 0) {
+            statusBar()->showMessage(
+                QString("已恢复 %1 个未完成的传输任务").arg(restored), 6000);
+        }
+        if (!terr.empty()) {
+            statusBar()->showMessage(
+                QString("传输恢复失败: %1").arg(QString::fromStdString(terr)),
+                8000);
+        }
+    }
 }
 
 MainWindow::~MainWindow() {
@@ -465,6 +512,7 @@ void MainWindow::enqueueUploads() {
         req.ftp = ci.ftp;
         req.ssh = ci.ssh;
         req.pushCommandTemplate = ci.pushCmdTemplate;
+        req.siteName = ci.siteName;
 
         if (model_->isDir(src)) {
             // Recursive upload: one job per file under the tree.
@@ -506,6 +554,7 @@ void MainWindow::enqueueDownloads() {
         req.localPath = localDir + "\\" + name;
         req.ftp = ci.ftp;
         req.ssh = ci.ssh;
+        req.siteName = ci.siteName;
 
         if (remote_->isDir(src)) {
             std::string err;

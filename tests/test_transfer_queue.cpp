@@ -8,6 +8,7 @@
 // up): pause parks a running transfer, cancel aborts it, happy path
 // finishes with a byte-identical roundtrip.
 #include "ftpflow/transfer_queue.hpp"
+#include "ftpflow/transfer_journal.hpp"
 
 #include <winsock2.h>
 #include <windows.h>
@@ -427,6 +428,151 @@ int main() {
             std::remove(remote.c_str());
             std::remove(remoteFtz.c_str());
         }
+    }
+
+    // ---- Part D: durable journal (offline, no server needed) ------------
+    {
+        const std::string jpath =
+            "C:/Users/wspne/AppData/Local/Temp/tq_journal.dat";
+        std::remove(jpath.c_str());
+
+        // Round-trip a record through the journal: secrets dropped, fields
+        // preserved.
+        {
+            ftpflow::TransferJournal j(jpath);
+            ftpflow::TransferRequest req;
+            req.protocol = ftpflow::BackendKind::Sftp;
+            req.direction = ftpflow::TransferDirection::Upload;
+            req.localPath = "C:/some/local/file.bin";
+            req.remotePath = "/remote/dir/file.bin";
+            req.ssh.host = "127.0.0.1";
+            req.ssh.port = 22;
+            req.ssh.user = "alice";
+            req.ssh.password = "s3cret";          // must NOT persist
+            req.ssh.privateKeyPem = "-----BEGIN...";   // must NOT persist
+            req.autoDecide = false;
+            req.mode = ftpflow::TransferMode::Compress;
+            req.zstdLevel = 7;
+            req.pushCommandTemplate = "zstd -d > {file}";
+            req.ftzArchive = false;
+            req.ensureRemoteDir = true;
+
+            ftpflow::JournalRecord rec =
+                ftpflow::TransferJournal::fromRequest(42, req);
+            CHECK(rec.ssh.password.empty());
+            CHECK(rec.ssh.privateKeyPem.empty());
+
+            std::vector<ftpflow::JournalRecord> recs;
+            recs.push_back(rec);
+            std::string err;
+            CHECK(j.save(recs, &err));
+
+            std::vector<ftpflow::JournalRecord> loaded;
+            CHECK(j.load(loaded, &err));
+            CHECK(loaded.size() == 1);
+            CHECK(loaded[0].jobId == 42);
+            CHECK(loaded[0].localPath == "C:/some/local/file.bin");
+            CHECK(loaded[0].remotePath == "/remote/dir/file.bin");
+            CHECK(loaded[0].protocol == ftpflow::BackendKind::Sftp);
+            CHECK(loaded[0].direction == ftpflow::TransferDirection::Upload);
+            CHECK(loaded[0].ssh.host == "127.0.0.1");
+            CHECK(loaded[0].ssh.user == "alice");
+            CHECK(loaded[0].ssh.password.empty());
+            CHECK(loaded[0].zstdLevel == 7);
+            CHECK(loaded[0].pushCommandTemplate == "zstd -d > {file}");
+            CHECK(loaded[0].ensureRemoteDir == true);
+        }
+
+        // remove() drops a record; save() with fewer records persists.
+        {
+            ftpflow::TransferJournal j(jpath);
+            std::string err;
+            CHECK(j.remove(42, &err));
+            std::vector<ftpflow::JournalRecord> loaded;
+            CHECK(j.load(loaded, &err));
+            CHECK(loaded.empty());
+        }
+
+        // Queue integration: enqueue persists, terminal state trims.
+        {
+            const std::string jpath2 =
+                "C:/Users/wspne/AppData/Local/Temp/tq_journal2.dat";
+            std::remove(jpath2.c_str());
+
+            // A job that fails fast (unroutable address) still reaches a
+            // terminal state and must be trimmed from the journal.
+            ftpflow::TransferQueue q(1, 50);
+            q.setJournal(jpath2);
+            Recorded r;
+            q.setEventCallback([&r](const ftpflow::TransferEvent& e) { record(&r, e); });
+            ftpflow::TransferRequest req;
+            req.protocol = ftpflow::BackendKind::Ftp;
+            req.ftp.host = "127.0.0.1";
+            req.ftp.port = 1;
+            req.ftp.connectTimeoutMs = 2000;
+            req.localPath = "C:/nonexistent.bin";
+            req.remotePath = "/x.bin";
+            q.enqueue(req);
+            q.waitAll();
+
+            // After a terminal state, the journal must be empty again.
+            ftpflow::TransferJournal j(jpath2);
+            std::vector<ftpflow::JournalRecord> recs;
+            std::string err;
+            CHECK(j.load(recs, &err));
+            CHECK(recs.empty());
+            CHECK(r.finished.load() == 1);
+            std::remove(jpath2.c_str());
+        }
+
+        // Restore semantics: seed a journal with one in-flight record,
+        // then a fresh queue replays it with resume=true.
+        {
+            const std::string jpath3 =
+                "C:/Users/wspne/AppData/Local/Temp/tq_journal3.dat";
+            std::remove(jpath3.c_str());
+
+            // Seed: a record that looks like a job interrupted mid-flight.
+            {
+                ftpflow::TransferJournal j(jpath3);
+                ftpflow::TransferRequest req;
+                req.protocol = ftpflow::BackendKind::Ftp;
+                req.ftp.host = "127.0.0.1";
+                req.ftp.port = 1;              // fails fast when restored
+                req.ftp.connectTimeoutMs = 2000;
+                req.localPath = "C:/Users/wspne/AppData/Local/Temp/tq_crash_src.bin";
+                req.remotePath = "/crash.bin";
+                makeFiller(req.localPath, 1024 * 1024);
+                std::vector<ftpflow::JournalRecord> recs;
+                recs.push_back(
+                    ftpflow::TransferJournal::fromRequest(7, req));
+                std::string err;
+                CHECK(j.save(recs, &err));
+                // Immediate self-check: the record round-trips.
+                std::vector<ftpflow::JournalRecord> chk;
+                CHECK(j.load(chk, &err));
+                CHECK(chk.size() == 1);
+                CHECK(chk[0].jobId == 7);
+            }
+
+            // Restore: a fresh queue replays it with resume=true.
+            ftpflow::TransferQueue q2(1, 50);
+            q2.setJournal(jpath3);
+            bool sawResume = false;
+            std::string terr;
+            std::size_t restored = q2.restore(&terr,
+                [&](ftpflow::TransferRequest& r) {
+                    sawResume = r.resume;     // resume forced on
+                });
+            CHECK(restored == 1);
+            CHECK(sawResume);
+            // The restored job fails fast (port 1) and is trimmed.
+            q2.waitAll();
+            std::remove("C:/Users/wspne/AppData/Local/Temp/tq_crash_src.bin");
+            std::remove(jpath3.c_str());
+        }
+
+        std::remove(jpath.c_str());
     }
 
     std::printf("%d checks, %d failed\n", g_checks, g_failed);

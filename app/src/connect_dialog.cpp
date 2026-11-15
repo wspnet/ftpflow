@@ -227,6 +227,9 @@ RemoteFsModel::ConnInfo ConnectDialog::connInfo() const {
         ? (ci.isSftp ? "." : "/")
         : startDir_->text().toStdString();
     ci.pushCmdTemplate = pushCmd_->text().toStdString();
+    // Saved-site reference for credential recovery on restore.
+    if (site_ && site_->currentIndex() > 0)
+        ci.siteName = site_->currentText().toStdString();
     return ci;
 }
 

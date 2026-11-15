@@ -607,10 +607,13 @@ int cmdQueue(const std::vector<std::string>& a) {
             "usage: ftpcli queue <ftp|sftp|ssh> <host[:port]> <user> <pw|-> [--key K]\n"
             "                     [--workers N] [--level N] [--cmd T] [--store]\n"
             "                     [--resume] [--ftz] [--down] [-r]\n"
+            "                     [--journal PATH] [--restore]\n"
             "                     <local> <remote> [...]\n"
-            "  --resume: continue from the already-transferred prefix.\n"
-            "  --ftz:    FTZ1 container mode (ssh/sftp endpoints only).\n"
-            "  --down:   download direction. -r: recursive (dir roots).\n");
+            "  --resume:  continue from the already-transferred prefix.\n"
+            "  --ftz:     FTZ1 container mode (ssh/sftp endpoints only).\n"
+            "  --down:    download direction. -r: recursive (dir roots).\n"
+            "  --journal: persist in-flight jobs to PATH (resumable on crash).\n"
+            "  --restore: replay PATH before the new jobs, resume=true.\n");
         return 2;
     }
     const std::string& proto = a[0];
@@ -637,6 +640,8 @@ int cmdQueue(const std::vector<std::string>& a) {
     bool ftz = false;
     bool down = false;
     bool recursive = false;
+    std::string journalPath;
+    bool restore = false;
     std::vector<std::string> pos;
     for (std::size_t i = 4; i < a.size(); ++i) {
         if (a[i] == "--key" && i + 1 < a.size()) {
@@ -661,6 +666,10 @@ int cmdQueue(const std::vector<std::string>& a) {
             down = true;
         } else if (a[i] == "-r" || a[i] == "--recursive") {
             recursive = true;
+        } else if (a[i] == "--journal" && i + 1 < a.size()) {
+            journalPath = a[++i];
+        } else if (a[i] == "--restore") {
+            restore = true;
         } else {
             pos.push_back(a[i]);
         }
@@ -671,6 +680,27 @@ int cmdQueue(const std::vector<std::string>& a) {
     }
 
     ftpflow::TransferQueue queue(workers);
+
+    // Durable journal: persist in-flight jobs, optionally restore first.
+    if (!journalPath.empty()) {
+        queue.setJournal(journalPath);
+        if (restore) {
+            std::string terr;
+            // Restored jobs need credentials again (the journal drops them);
+            // supply the endpoint from this invocation's command line.
+            const std::size_t n = queue.restore(&terr,
+                [&](ftpflow::TransferRequest& r) {
+                    r.ftp = fopt;
+                    r.ssh = ep;
+                    r.pushCommandTemplate = cmdTemplate;
+                });
+            if (!terr.empty())
+                std::fprintf(stderr, "queue: restore warning: %s\n", terr.c_str());
+            std::printf("[queue] restored %llu in-flight job(s) from %s\n",
+                        (unsigned long long)n, journalPath.c_str());
+        }
+    }
+
     queue.setEventCallback([](const ftpflow::TransferEvent& e) {
         const char* kind = e.kind == ftpflow::TransferEvent::Kind::Started   ? "start"
                           : e.kind == ftpflow::TransferEvent::Kind::Progress ? "prog "
