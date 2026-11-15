@@ -105,6 +105,11 @@ public:
     void setStdoutSink(std::function<void(const void*, std::size_t)> fn);
     void setStderrSink(std::function<void(const void*, std::size_t)> fn);
 
+    // Half-close our side: the remote command sees EOF on stdin. Needed by
+    // streaming agents (e.g. `zstd -d`) that run until stdin ends; close()
+    // alone also sends EOF but then discards the exit status.
+    SshResult sendEof();
+
     void close();
 
     // Remote exit status when the channel closed cleanly, else -1.

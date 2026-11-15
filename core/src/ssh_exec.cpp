@@ -233,6 +233,21 @@ SshResult SshExec::write(const void* data, std::size_t len, int timeoutMs) {
     return {};
 }
 
+SshResult SshExec::sendEof() {
+    if (state_ != State::Open || !impl_ || !impl_->channel) {
+        return {SshStatus::Closed, "channel not open"};
+    }
+    int rc = 0;
+    while ((rc = libssh2_channel_send_eof(impl_->channel))
+           == LIBSSH2_ERROR_EAGAIN) {
+        waitSocket(impl_->sock, true, 5000);
+    }
+    if (rc != 0) {
+        return mapSshErr(SshStatus::IoError, "send eof", impl_->session);
+    }
+    return {};
+}
+
 void SshExec::setStdoutSink(std::function<void(const void*, std::size_t)> fn) {
     if (impl_ == nullptr) impl_ = new Impl();
     impl_->onStdout = std::move(fn);
@@ -319,6 +334,9 @@ SshResult SshExec::open(const SshEndpoint&, const std::string&,
             "built without libssh2 (build with FTPFLOW_WITH_LIBSSH2 / --full preset)"};
 }
 SshResult SshExec::write(const void*, std::size_t, int) {
+    return {SshStatus::EngineUnavailable, "built without libssh2"};
+}
+SshResult SshExec::sendEof() {
     return {SshStatus::EngineUnavailable, "built without libssh2"};
 }
 bool SshExec::pump(int) { return false; }

@@ -7,10 +7,17 @@
 #include <string>
 #include <vector>
 
+#include <io.h>
+
+#if defined(FTPFLOW_HAVE_ZSTD)
+#include <zstd.h>
+#endif
+
 #include "ftpflow/compress_decide.hpp"
 #include "ftpflow/ftp_session.hpp"
 #include "ftpflow/protocol_status.hpp"
 #include "ftpflow/ssh_exec.hpp"
+#include "ftpflow/ssh_transfer.hpp"
 #include "ftpflow/version.hpp"
 #include "ftpflow/vfs_local.hpp"
 
@@ -220,6 +227,127 @@ int cmdSshExec(const std::vector<std::string>& args) {
     return ssh.exitCode() == 0 ? 0 : 1;
 }
 
+// ssh push <host> <user> <password|-> [--key <path>] [--level N]
+//          [--cmd <template>] <local> <remote>
+//   The compressed-transfer fast path: client zstd-streams the local file
+//   into the exec channel's stdin; the remote command decompresses stdin
+//   to <remote>. The default command assumes a zstd-equipped host; --cmd
+//   overrides it ({file} is replaced by the quoted remote path), e.g. on
+//   hosts without zstd: --cmd "\"C:\path\ftpcli.exe\" zdecode > {file}".
+int cmdSshPush(const std::vector<std::string>& args) {
+    if (args.size() < 5) {
+        std::fprintf(stderr,
+            "usage: ftpcli ssh push <host> <user> <password|-> [--key <path>]\n"
+            "                       [--level N] [--cmd <template>] <local> <remote>\n"
+            "  remote default: 'zstd -d -c - -o {file}'\n");
+        return 2;
+    }
+    ftpflow::SshEndpoint ep;
+    ep.host = args[0];
+    ep.user = args[1];
+    ep.password = args[2];
+    const std::size_t colon = ep.host.rfind(':');
+    if (colon != std::string::npos && colon + 1 < ep.host.size()) {
+        ep.port = static_cast<std::uint16_t>(std::atoi(ep.host.c_str() + colon + 1));
+        ep.host = ep.host.substr(0, colon);
+    }
+    std::string cmdTemplate = ftpflow::sshDefaultPushCommandTemplate();
+    ftpflow::SshPushOptions opts;
+    std::string local, remote;
+    for (std::size_t i = 3; i < args.size(); ++i) {
+        if (args[i] == "--key" && i + 1 < args.size()) {
+            ep.privateKeyPem = readWholeFile(args[++i]);
+            if (ep.privateKeyPem.empty()) {
+                std::fprintf(stderr, "ssh push: cannot read key file %s\n", args[i].c_str());
+                return 2;
+            }
+        } else if (args[i] == "--level" && i + 1 < args.size()) {
+            opts.zstdLevel = std::atoi(args[++i].c_str());
+        } else if (args[i] == "--cmd" && i + 1 < args.size()) {
+            cmdTemplate = args[++i];
+        } else if (local.empty()) {
+            local = args[i];
+        } else if (remote.empty()) {
+            remote = args[i];
+        } else {
+            std::fprintf(stderr, "ssh push: unexpected arg %s\n", args[i].c_str());
+            return 2;
+        }
+    }
+    if (local.empty() || remote.empty()) {
+        std::fprintf(stderr, "ssh push: need <local> <remote>\n");
+        return 2;
+    }
+
+    std::string command = cmdTemplate;
+    const std::string quoted = "\"" + remote + "\"";
+    for (std::size_t pos; (pos = command.find("{file}")) != std::string::npos;)
+        command.replace(pos, 6, quoted);
+
+    ftpflow::SshExec ssh(ftpflow::HostKeyPolicy::AcceptNew);
+    std::string acceptedKey;
+    ftpflow::SshResult r = ssh.open(ep, command, {}, &acceptedKey);
+    if (!r.ok()) {
+        std::fprintf(stderr, "ssh open failed [%s]: %s\n",
+            ftpflow::sshStatusName(r.status), r.message.c_str());
+        return 1;
+    }
+
+    ftpflow::SshPushStats st;
+    ftpflow::SshResult pr = ftpflow::sshPushFile(ssh, local, opts, &st);
+    if (!pr.ok()) {
+        std::fprintf(stderr, "ssh push failed [%s]: %s\n",
+            ftpflow::sshStatusName(pr.status), pr.message.c_str());
+        return 1;
+    }
+    std::printf("pushed %llu -> %llu bytes (ratio %.1f%%, exit=%d, level=%d)\n",
+        static_cast<unsigned long long>(st.localBytes),
+        static_cast<unsigned long long>(st.compressedBytes),
+        st.ratio() * 100.0, ssh.exitCode(), opts.zstdLevel);
+    return 0;
+}
+
+// zdecode -- the remote-agent stand-in: reads a zstd stream from stdin and
+// writes the decompressed bytes to stdout (binary-safe). Used as the
+// --cmd payload on hosts without a system zstd, and doubles as the
+// reference consumer of sshPushFile's output format.
+int cmdZdecode(const std::vector<std::string>& args) {
+    (void)args;
+#if defined(FTPFLOW_HAVE_ZSTD)
+    _setmode(_fileno(stdin), 0x8000);    // _O_BINARY
+    _setmode(_fileno(stdout), 0x8000);
+
+    ZSTD_DStream* ds = ZSTD_createDStream();
+    if (!ds) return 2;
+    if (ZSTD_isError(ZSTD_initDStream(ds))) { ZSTD_freeDStream(ds); return 2; }
+
+    std::vector<std::uint8_t> in(ZSTD_DStreamInSize());
+    std::vector<std::uint8_t> out(ZSTD_DStreamOutSize());
+    int rc = 0;
+    for (;;) {
+        const std::size_t got = std::fread(in.data(), 1, in.size(), stdin);
+        ZSTD_inBuffer zin{in.data(), got, 0};
+        do {
+            ZSTD_outBuffer zout{out.data(), out.size(), 0};
+            const std::size_t r = ZSTD_decompressStream(ds, &zout, &zin);
+            if (ZSTD_isError(r)) {
+                std::fprintf(stderr, "zdecode: %s\n", ZSTD_getErrorName(r));
+                rc = 1;
+                break;
+            }
+            if (zout.pos > 0) std::fwrite(out.data(), 1, zout.pos, stdout);
+        } while (zin.pos < zin.size);
+        if (rc != 0 || got < in.size()) break;   // EOF
+    }
+    std::fflush(stdout);
+    ZSTD_freeDStream(ds);
+    return rc;
+#else
+    std::fprintf(stderr, "zdecode: built without zstd\n");
+    return 2;
+#endif
+}
+
 }  // namespace
 
 namespace {
@@ -334,7 +462,10 @@ int main(int argc, char** argv) {
             "  ftpcli decide [--bw MIBPS] <file...>   run the 5-stage funnel\n"
             "  ftpcli info <dir>                      directory listing smoke test\n"
             "  ftpcli ftp ls|size|get|put <host> ...  FTP smoke surface\n"
-            "  ftpcli ssh exec <host[:port]> <user> <password> <cmd...>\n",
+            "  ftpcli ssh exec <host[:port]> <user> <password> <cmd...>\n"
+            "  ftpcli ssh push <host> <user> <pw|-> [--key K] [--level N]\n"
+            "                   [--cmd T] <local> <remote>   zstd exec-channel push\n"
+            "  ftpcli zdecode                         stdin zstd -> stdout (agent)\n",
             ftpflow::versionString());
         return args.empty() ? 2 : 0;
     }
@@ -344,12 +475,16 @@ int main(int argc, char** argv) {
     if (cmd == "decide") return cmdDecide(rest);
     if (cmd == "info") return cmdInfo(rest);
     if (cmd == "ftp") return cmdFtp(rest);
+    if (cmd == "zdecode") return cmdZdecode(rest);
     if (cmd == "ssh") {
-        if (rest.empty() || rest[0] != "exec") {
-            std::fprintf(stderr, "usage: ftpcli ssh exec <host> <user> <password> <cmd...>\n");
+        if (rest.empty() || (rest[0] != "exec" && rest[0] != "push")) {
+            std::fprintf(stderr, "usage: ftpcli ssh exec|push ...\n");
             return 2;
         }
-        return cmdSshExec(std::vector<std::string>(rest.begin() + 1, rest.end()));
+        const bool push = rest[0] == "push";
+        return push
+            ? cmdSshPush(std::vector<std::string>(rest.begin() + 1, rest.end()))
+            : cmdSshExec(std::vector<std::string>(rest.begin() + 1, rest.end()));
     }
     std::fprintf(stderr, "unknown command: %s (try --help)\n", cmd.c_str());
     return 2;
