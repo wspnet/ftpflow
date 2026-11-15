@@ -168,6 +168,20 @@ def main() -> int:
     configure = [cmake, "--preset", preset]
     if args.no_gui:
         configure += ["-DFTPFLOW_BUILD_GUI=OFF"]
+    else:
+        # Auto-detect a Qt install (aqt-style layout) and feed CMake.
+        qt_candidates = [
+            Path(r"C:\Qt\6.12.0\msvc2022_64"),
+            Path(r"C:\Qt\6.11.3\msvc2022_64"),
+        ]
+        qt_root = os.environ.get("Qt6_DIR", "")
+        if qt_root:
+            qt_candidates.insert(0, Path(qt_root))
+        for q in qt_candidates:
+            if (q / "lib" / "cmake" / "Qt6").exists():
+                configure.append(f"-DCMAKE_PREFIX_PATH={q}")
+                print(f"[build_native] Qt6 detected at {q}")
+                break
     rc = run(configure)
     if rc != 0 or args.configure_only:
         return rc
