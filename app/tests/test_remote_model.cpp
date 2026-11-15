@@ -101,6 +101,42 @@ int main(int argc, char** argv) {
         waitFor([&] { return m.currentPath() == "/"; }, 8000);
         CHECK(m.currentPath() == "/");
 
+        // ---- remote ops: mkdir -> rename -> remove --------------------
+        {
+            bool opOk = false, opFail = false;
+            QObject::connect(&m, &RemoteFsModel::opFinished,
+                             [&] { opOk = true; });
+            QObject::connect(&m, &RemoteFsModel::opFailed,
+                             [&](const QString&) { opFail = true; });
+            auto hasEntry = [&](const std::string& p) {
+                for (int i = 0; i < m.rowCount(); ++i)
+                    if (m.pathAt(m.index(i, 0)) == p) return true;
+                return false;
+            };
+            auto indexFor = [&](const std::string& p) {
+                for (int i = 0; i < m.rowCount(); ++i)
+                    if (m.pathAt(m.index(i, 0)) == p) return m.index(i, 0);
+                return QModelIndex();
+            };
+
+            m.makeDir("rm_probe");
+            CHECK(waitFor([&] { return opOk || opFail; }, 8000));
+            CHECK(opOk);
+            CHECK(waitFor([&] { return hasEntry("/rm_probe"); }, 8000));
+
+            opOk = false;
+            m.renameEntry(indexFor("/rm_probe"), "rm_probe2");
+            CHECK(waitFor([&] { return opOk || opFail; }, 8000));
+            CHECK(opOk);
+            CHECK(waitFor([&] { return hasEntry("/rm_probe2"); }, 8000));
+
+            opOk = false;
+            m.removeEntries({indexFor("/rm_probe2")});
+            CHECK(waitFor([&] { return opOk || opFail; }, 8000));
+            CHECK(opOk);
+            CHECK(waitFor([&] { return !hasEntry("/rm_probe2"); }, 8000));
+        }
+
         // Disconnect cleanly (worker thread joins in the destructor).
         m.disconnect();
         CHECK(!m.isConnected());
@@ -143,6 +179,42 @@ int main(int argc, char** argv) {
             CHECK(m.rowCount() >= 1);
             std::printf("[info] SFTP leg: %d entries in start dir\n",
                         m.rowCount());
+
+            // ---- remote ops over SFTP (relative names under cwd) -----
+            {
+                bool opOk = false, opFail = false;
+                QObject::connect(&m, &RemoteFsModel::opFinished,
+                                 [&] { opOk = true; });
+                QObject::connect(&m, &RemoteFsModel::opFailed,
+                                 [&](const QString&) { opFail = true; });
+                auto hasEntry = [&](const std::string& p) {
+                    for (int i = 0; i < m.rowCount(); ++i)
+                        if (m.pathAt(m.index(i, 0)) == p) return true;
+                    return false;
+                };
+                auto indexFor = [&](const std::string& p) {
+                    for (int i = 0; i < m.rowCount(); ++i)
+                        if (m.pathAt(m.index(i, 0)) == p) return m.index(i, 0);
+                    return QModelIndex();
+                };
+
+                m.makeDir("rm_sftp_probe");
+                CHECK(waitFor([&] { return opOk || opFail; }, 10000));
+                CHECK(opOk);
+                CHECK(waitFor([&] { return hasEntry("rm_sftp_probe"); }, 10000));
+
+                opOk = false;
+                m.renameEntry(indexFor("rm_sftp_probe"), "rm_sftp_probe2");
+                CHECK(waitFor([&] { return opOk || opFail; }, 10000));
+                CHECK(opOk);
+                CHECK(waitFor([&] { return hasEntry("rm_sftp_probe2"); }, 10000));
+
+                opOk = false;
+                m.removeEntries({indexFor("rm_sftp_probe2")});
+                CHECK(waitFor([&] { return opOk || opFail; }, 10000));
+                CHECK(opOk);
+                CHECK(waitFor([&] { return !hasEntry("rm_sftp_probe2"); }, 10000));
+            }
             m.disconnect();
         }
     }

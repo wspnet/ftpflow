@@ -5,6 +5,7 @@
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QIntValidator>
 #include <QLabel>
 #include <QLineEdit>
@@ -26,7 +27,8 @@ std::string readWholeFileStr(const QString& path) {
 
 }  // namespace
 
-ConnectDialog::ConnectDialog(QWidget* parent) : QDialog(parent) {
+ConnectDialog::ConnectDialog(QWidget* parent, SiteStore* store)
+    : QDialog(parent), store_(store) {
     buildUi();
 }
 
@@ -35,6 +37,25 @@ void ConnectDialog::buildUi() {
     setMinimumWidth(460);
 
     auto* form = new QFormLayout;
+
+    if (store_) {
+        site_ = new QComboBox(this);
+        site_->addItem("-- 手动输入 --");
+        for (const SiteEntry& e : store_->sites()) {
+            site_->addItem(e.name);
+        }
+        saveSiteBtn_ = new QPushButton("保存为站点...", this);
+        auto* siteRow = new QWidget(this);
+        auto* siteLay = new QHBoxLayout(siteRow);
+        siteLay->setContentsMargins(0, 0, 0, 0);
+        siteLay->addWidget(site_, 1);
+        siteLay->addWidget(saveSiteBtn_);
+        form->addRow("站点:", siteRow);
+        connect(site_, &QComboBox::currentIndexChanged, this,
+                &ConnectDialog::onSiteChosen);
+        connect(saveSiteBtn_, &QPushButton::clicked, this,
+                &ConnectDialog::onSaveSite);
+    }
 
     proto_ = new QComboBox(this);
     proto_->addItem("SFTP (SSH)");
@@ -119,6 +140,69 @@ void ConnectDialog::onBrowseKey() {
     const QString path = QFileDialog::getOpenFileName(
         this, "选择 PEM 私钥", {}, "密钥文件 (*)");
     if (!path.isEmpty()) keyPath_->setText(path);
+}
+
+void ConnectDialog::onSiteChosen(int index) {
+    if (!store_ || index <= 0) return;   // 0 = manual entry
+    const QString name = site_->itemText(index);
+    for (const SiteEntry& e : store_->sites()) {
+        if (e.name != name) continue;
+        loadSite(store_->withPassword(e));
+        return;
+    }
+}
+
+void ConnectDialog::onSaveSite() {
+    if (!store_) return;
+    if (host_->text().trimmed().isEmpty() ||
+        user_->text().trimmed().isEmpty()) {
+        host_->setFocus();
+        return;
+    }
+    bool ok = false;
+    QString name = site_->currentIndex() > 0
+        ? site_->currentText()
+        : host_->text().trimmed();
+    name = QInputDialog::getText(this, "保存站点", "站点名称:", QLineEdit::Normal,
+                                 name, &ok);
+    if (!ok || name.trimmed().isEmpty()) return;
+    name = name.trimmed();
+
+    SiteEntry e;
+    e.name = name;
+    e.isSftp = proto_->currentIndex() == 0;
+    e.host = host_->text().trimmed();
+    e.port = port_->text().toInt();
+    e.user = user_->text().trimmed();
+    e.keyPath = keyPath_->text().trimmed();
+    e.startDir = startDir_->text().trimmed();
+    e.pushCmd = pushCmd_->text().trimmed();
+    store_->upsert(e);
+    if (store_->save() && !password_->text().isEmpty()) {
+        // Password round-trips through the Windows Credential Manager;
+        // a write failure only means it will not auto-fill next time.
+        SiteStore::writePassword(name, password_->text());
+    }
+    // Refresh the combo with the new entry and keep it selected.
+    const int cur = site_->currentIndex();
+    site_->blockSignals(true);
+    site_->clear();
+    site_->addItem("-- 手动输入 --");
+    for (const SiteEntry& s : store_->sites()) site_->addItem(s.name);
+    const int idx = site_->findText(name);
+    site_->setCurrentIndex(idx > 0 ? idx : cur);
+    site_->blockSignals(false);
+}
+
+void ConnectDialog::loadSite(const SiteEntry& e) {
+    proto_->setCurrentIndex(e.isSftp ? 0 : 1);
+    host_->setText(e.host);
+    port_->setText(QString::number(e.port));
+    user_->setText(e.user);
+    password_->setText(e.password);
+    keyPath_->setText(e.keyPath);
+    startDir_->setText(e.startDir);
+    pushCmd_->setText(e.pushCmd);
 }
 
 RemoteFsModel::ConnInfo ConnectDialog::connInfo() const {

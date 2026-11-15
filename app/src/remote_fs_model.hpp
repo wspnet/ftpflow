@@ -59,7 +59,15 @@ public:
     void refresh();
 
     std::string pathAt(const QModelIndex& idx) const;
+    std::string nameAt(const QModelIndex& idx) const;
     bool isDir(const QModelIndex& idx) const;
+
+    // ---- async remote operations (worker thread) -------------------------
+    // Each emits opFinished / opFailed; success auto-refreshes the current
+    // directory. `name` is relative to the current directory.
+    void makeDir(const std::string& name);
+    void removeEntries(const QModelIndexList& rows);   // recursive for dirs
+    void renameEntry(const QModelIndex& idx, const std::string& newName);
 
     int rowCount(const QModelIndex& parent = {}) const override;
     int columnCount(const QModelIndex& parent = {}) const override;
@@ -74,20 +82,31 @@ signals:
     void connectFailed(const QString& message);
     void browseFailed(const QString& message);
     void disconnected();
+    void opFinished(const QString& message);
+    void opFailed(const QString& message);
 
 private:
+    struct OpTarget {
+        std::string path;
+        bool isDir = false;
+    };
+
     struct Task {
-        enum class Kind : std::uint8_t { Connect, Disconnect, List, Shutdown };
+        enum class Kind : std::uint8_t {
+            Connect, Disconnect, List, MakeDir, Remove, Rename, Shutdown,
+        };
         Kind kind = Kind::List;
         ConnInfo conn;                 // Connect
-        std::string dir;               // List
+        std::string dir;               // List / op working directory
         std::string startAfter;        // List cursor (SFTP)
+        std::string name;              // MakeDir target / Rename new name
+        std::vector<OpTarget> targets; // Remove / Rename source
         std::uint64_t generation = 0;  // List staleness tag
     };
 
     void workerLoop();
     void postListing(std::uint64_t generation, const std::string& dir,
-                     std::vector<Entry> entries, bool hasMore,
+                     std::vector<Entry> entries, bool hasMore, bool append,
                      const std::string& error);
     void pushTask(Task t);
     std::string joinRemote(const std::string& dir, const std::string& name) const;

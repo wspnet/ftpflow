@@ -6,6 +6,8 @@
 
 #include <cstdio>
 
+#include "ftpflow/tree_walk.hpp"
+
 namespace ftpflow {
 namespace {
 
@@ -19,6 +21,65 @@ QString humanSize(std::uint64_t n) {
 }
 
 constexpr std::uint32_t kPageEntries = 500;
+
+// Recursive remote removal: files first, then directories deepest-first,
+// then the root. Returns "" on success, a human message on the first
+// failure.
+std::string removeSftpRecursive(SftpSession& s, const std::string& path,
+                                bool isDir) {
+    if (!isDir) {
+        const SftpResult r = s.removeFile(path);
+        return r.ok() ? std::string()
+                      : "删除失败 " + path + ": " + r.message;
+    }
+    std::vector<TreeEntry> entries;
+    std::string walkErr;
+    if (!walkRemoteTree(s, path, entries, &walkErr))
+        return "读取目录失败 " + path + ": " + walkErr;
+    for (const TreeEntry& e : entries) {
+        if (e.isDir) continue;
+        const std::string p = joinTreePath(path, e.relPath);
+        const SftpResult r = s.removeFile(p);
+        if (!r.ok()) return "删除失败 " + p + ": " + r.message;
+    }
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+        if (!it->isDir) continue;
+        const std::string p = joinTreePath(path, it->relPath);
+        const SftpResult r = s.removeDir(p);
+        if (!r.ok()) return "删除目录失败 " + p + ": " + r.message;
+    }
+    const SftpResult r = s.removeDir(path);
+    return r.ok() ? std::string()
+                  : "删除目录失败 " + path + ": " + r.message;
+}
+
+std::string removeFtpRecursive(FtpSession& f, const std::string& path,
+                               bool isDir) {
+    if (!isDir) {
+        const FtpResult r = f.removeFile(path);
+        return r.ok() ? std::string()
+                      : "删除失败 " + path + ": " + r.message;
+    }
+    std::vector<TreeEntry> entries;
+    std::string walkErr;
+    if (!walkRemoteTree(f, path, entries, &walkErr))
+        return "读取目录失败 " + path + ": " + walkErr;
+    for (const TreeEntry& e : entries) {
+        if (e.isDir) continue;
+        const std::string p = joinTreePath(path, e.relPath);
+        const FtpResult r = f.removeFile(p);
+        if (!r.ok()) return "删除失败 " + p + ": " + r.message;
+    }
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+        if (!it->isDir) continue;
+        const std::string p = joinTreePath(path, it->relPath);
+        const FtpResult r = f.removeDir(p);
+        if (!r.ok()) return "删除目录失败 " + p + ": " + r.message;
+    }
+    const FtpResult r = f.removeDir(path);
+    return r.ok() ? std::string()
+                  : "删除目录失败 " + path + ": " + r.message;
+}
 
 }  // namespace
 
@@ -116,10 +177,58 @@ std::string RemoteFsModel::pathAt(const QModelIndex& idx) const {
     return joinRemote(currentPath_, entryAt(idx.row()).name);
 }
 
+std::string RemoteFsModel::nameAt(const QModelIndex& idx) const {
+    if (!idx.isValid() || idx.row() >= static_cast<int>(entries_.size()))
+        return {};
+    return entryAt(idx.row()).name;
+}
+
 bool RemoteFsModel::isDir(const QModelIndex& idx) const {
     if (!idx.isValid() || idx.row() >= static_cast<int>(entries_.size()))
         return false;
     return entryAt(idx.row()).type == EntryType::Directory;
+}
+
+void RemoteFsModel::makeDir(const std::string& name) {
+    if (!connected_ || name.empty()) return;
+    Task t;
+    t.kind = Task::Kind::MakeDir;
+    t.dir = currentPath_;
+    t.name = name;
+    t.generation = navGen_;
+    pushTask(std::move(t));
+}
+
+void RemoteFsModel::removeEntries(const QModelIndexList& rows) {
+    if (!connected_) return;
+    Task t;
+    t.kind = Task::Kind::Remove;
+    t.dir = currentPath_;
+    t.generation = navGen_;
+    for (const QModelIndex& idx : rows) {
+        if (!idx.isValid() || idx.row() >= static_cast<int>(entries_.size()))
+            continue;
+        OpTarget tgt;
+        tgt.path = joinRemote(currentPath_, entryAt(idx.row()).name);
+        tgt.isDir = entryAt(idx.row()).type == EntryType::Directory;
+        t.targets.push_back(std::move(tgt));
+    }
+    if (!t.targets.empty()) pushTask(std::move(t));
+}
+
+void RemoteFsModel::renameEntry(const QModelIndex& idx,
+                                const std::string& newName) {
+    if (!idx.isValid() || !connected_ || newName.empty()) return;
+    Task t;
+    t.kind = Task::Kind::Rename;
+    t.dir = currentPath_;
+    t.name = newName;
+    t.generation = navGen_;
+    OpTarget tgt;
+    tgt.path = pathAt(idx);
+    tgt.isDir = isDir(idx);
+    t.targets.push_back(std::move(tgt));
+    pushTask(std::move(t));
 }
 
 // ---- model plumbing -------------------------------------------------------
@@ -247,6 +356,63 @@ void RemoteFsModel::workerLoop() {
             t.dir = t.conn.startDir;
         }
 
+        if (t.kind == Task::Kind::MakeDir || t.kind == Task::Kind::Remove ||
+            t.kind == Task::Kind::Rename) {
+            std::string error;
+            if (t.kind == Task::Kind::MakeDir) {
+                const std::string path = joinRemote(t.dir, t.name);
+                if (sftp) {
+                    const SftpResult r = sftp->mkdir(path, 0755);
+                    if (!r.ok()) error = "新建目录失败: " + r.message;
+                } else if (ftp) {
+                    const FtpResult r = ftp->mkdir(path);
+                    if (!r.ok()) error = "新建目录失败: " + r.message;
+                } else {
+                    error = "会话未连接";
+                }
+            } else if (t.kind == Task::Kind::Remove) {
+                for (const OpTarget& tgt : t.targets) {
+                    std::string one;
+                    if (sftp) {
+                        one = removeSftpRecursive(*sftp, tgt.path, tgt.isDir);
+                    } else if (ftp) {
+                        one = removeFtpRecursive(*ftp, tgt.path, tgt.isDir);
+                    } else {
+                        one = "会话未连接";
+                    }
+                    if (!one.empty()) {
+                        error = one;
+                        break;
+                    }
+                }
+            } else {   // Rename (single target; new name under t.dir)
+                const std::string from = t.targets.front().path;
+                const std::string to = joinRemote(t.dir, t.name);
+                if (sftp) {
+                    const SftpResult r = sftp->rename(from, to);
+                    if (!r.ok()) error = "重命名失败: " + r.message;
+                } else if (ftp) {
+                    const FtpResult r = ftp->rename(from, to);
+                    if (!r.ok()) error = "重命名失败: " + r.message;
+                } else {
+                    error = "会话未连接";
+                }
+            }
+            QMetaObject::invokeMethod(
+                this,
+                [this, error] {
+                    if (error.empty()) emit opFinished({});
+                    else emit opFailed(QString::fromStdString(error));
+                },
+                Qt::QueuedConnection);
+            if (!error.empty()) continue;
+            // Success: relist the directory the op happened in.
+            t.kind = Task::Kind::List;
+            t.startAfter.clear();
+            t.name.clear();
+            t.targets.clear();
+        }
+
         // List.
         std::vector<Entry> entries;
         bool hasMore = false;
@@ -269,8 +435,10 @@ void RemoteFsModel::workerLoop() {
         QMetaObject::invokeMethod(
             this,
             [this, gen = t.generation, dir = t.dir,
-             entries = std::move(entries), hasMore, error]() mutable {
-                postListing(gen, dir, std::move(entries), hasMore, error);
+             entries = std::move(entries), hasMore, error,
+             append = !t.startAfter.empty()]() mutable {
+                postListing(gen, dir, std::move(entries), hasMore, append,
+                            error);
             },
             Qt::QueuedConnection);
     }
@@ -279,7 +447,7 @@ void RemoteFsModel::workerLoop() {
 void RemoteFsModel::postListing(std::uint64_t generation,
                                 const std::string& dir,
                                 std::vector<Entry> entries, bool hasMore,
-                                const std::string& error) {
+                                bool append, const std::string& error) {
     // Stale result (the user navigated again meanwhile)?
     if (generation != navGen_) return;
 
@@ -288,7 +456,9 @@ void RemoteFsModel::postListing(std::uint64_t generation,
         return;
     }
 
-    const bool appending = !lastOfCurrentPage_.empty();
+    // append=true only for fetchMore continuation (startAfter cursor set);
+    // refreshes replace the listing wholesale.
+    const bool appending = append && !lastOfCurrentPage_.empty();
     if (!appending) {
         beginResetModel();
         entries_ = std::move(entries);

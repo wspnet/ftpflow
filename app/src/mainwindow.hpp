@@ -11,6 +11,7 @@
 #include "ftpflow/transfer_queue.hpp"
 #include "local_fs_model.hpp"
 #include "remote_fs_model.hpp"
+#include "site_store.hpp"
 
 class QListWidget;
 class QListWidgetItem;
@@ -41,6 +42,8 @@ private slots:
     void onRemoteConnected();
     void onRemoteConnectFailed(const QString& msg);
     void onRemoteBrowseFailed(const QString& msg);
+    void onRemoteOpFailed(const QString& msg);
+    void onRemoteContextMenu(const QPoint& pos);
 
 private:
     void buildUi();
@@ -63,6 +66,8 @@ private:
     QLineEdit* remotePathEdit_ = nullptr;
     QPushButton* connectBtn_ = nullptr;
     QPushButton* disconnectBtn_ = nullptr;
+
+    SiteStore siteStore_;
 
     QDockWidget* transferDock_ = nullptr;
     QListWidget* transferList_ = nullptr;

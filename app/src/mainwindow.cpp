@@ -1,12 +1,16 @@
 // ftpflow -- main window implementation.
 #include "mainwindow.hpp"
 
+#include <QAction>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMenu>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QSortFilterProxyModel>
 #include <QSplitter>
@@ -37,6 +41,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildUi();
     setWindowTitle(QString("ftpflow %1 - 文件传输工作台")
                        .arg(versionString()));
+
+    siteStore_.load();
 
     queue_ = std::make_unique<TransferQueue>(2, 100);
     queue_->setEventCallback([this](const TransferEvent& ev) {
@@ -178,6 +184,12 @@ void MainWindow::buildUi() {
             &MainWindow::onRemoteConnectFailed);
     connect(remote_, &RemoteFsModel::browseFailed, this,
             &MainWindow::onRemoteBrowseFailed);
+    connect(remote_, &RemoteFsModel::opFailed, this,
+            &MainWindow::onRemoteOpFailed);
+    // Right-click: remote file operations.
+    rightTable_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(rightTable_, &QTableView::customContextMenuRequested, this,
+            &MainWindow::onRemoteContextMenu);
     // Enable/disable the navigation buttons with connection state.
     connect(remote_, &RemoteFsModel::connected, this, [this, remoteUpBtn,
                                                        remoteRefreshBtn] {
@@ -274,7 +286,7 @@ void MainWindow::onVerdictsReady() {
 // ---- remote pane ------------------------------------------------------------
 
 void MainWindow::onConnect() {
-    ConnectDialog dlg(this);
+    ConnectDialog dlg(this, &siteStore_);
     if (dlg.exec() != QDialog::Accepted) return;
     connectBtn_->setEnabled(false);
     remotePathEdit_->setText("连接中...");
@@ -323,6 +335,72 @@ void MainWindow::onRemoteActivated(const QModelIndex& idx) {
     }
 }
 
+void MainWindow::onRemoteOpFailed(const QString& msg) {
+    statusBar()->showMessage(msg, 8000);
+}
+
+void MainWindow::onRemoteContextMenu(const QPoint& pos) {
+    if (!remote_->isConnected()) return;
+    const QModelIndex proxyIdx = rightTable_->indexAt(pos);
+    const QModelIndex idx =
+        proxyIdx.isValid() ? remoteProxy_->mapToSource(proxyIdx) : QModelIndex();
+
+    QMenu menu(this);
+    QAction* mkdirAction = menu.addAction("新建文件夹...");
+    QAction* renameAction = menu.addAction("重命名...");
+    QAction* removeAction = menu.addAction("删除...");
+    menu.addSeparator();
+    QAction* refreshAction = menu.addAction("刷新");
+    if (!idx.isValid()) {
+        renameAction->setEnabled(false);
+        removeAction->setEnabled(false);
+    }
+
+    QAction* chosen = menu.exec(rightTable_->viewport()->mapToGlobal(pos));
+    if (!chosen) return;
+    if (chosen == mkdirAction) {
+        bool ok = false;
+        const QString name = QInputDialog::getText(
+            this, "新建文件夹", "文件夹名称:", QLineEdit::Normal, {}, &ok);
+        if (ok && !name.trimmed().isEmpty()) {
+            remote_->makeDir(name.trimmed().toStdString());
+        }
+    } else if (chosen == renameAction) {
+        bool ok = false;
+        const QString oldName =
+            QString::fromStdString(remote_->nameAt(idx));
+        const QString name = QInputDialog::getText(
+            this, "重命名", "新名称:", QLineEdit::Normal, oldName, &ok);
+        if (ok && !name.trimmed().isEmpty() && name != oldName) {
+            remote_->renameEntry(idx, name.trimmed().toStdString());
+        }
+    } else if (chosen == removeAction) {
+        QModelIndexList rows = rightTable_->selectionModel()->selectedRows(0);
+        if (rows.isEmpty()) rows = {proxyIdx};
+        QStringList names;
+        QModelIndexList srcRows;
+        for (const QModelIndex& r : rows) {
+            const QModelIndex src = remoteProxy_->mapToSource(r);
+            if (!src.isValid()) continue;
+            srcRows.push_back(src);
+            names << QString::fromStdString(remote_->nameAt(src));
+        }
+        if (srcRows.isEmpty()) return;
+        const QString message = QString(
+            "即将从远端删除 %1 个条目（目录将递归删除，不可恢复）：\n\n%2\n\n"
+            "确定删除吗？")
+            .arg(names.size())
+            .arg(names.join('\n').left(400));
+        if (QMessageBox::warning(this, "删除确认", message,
+                                 QMessageBox::Yes | QMessageBox::No,
+                                 QMessageBox::No) == QMessageBox::Yes) {
+            remote_->removeEntries(srcRows);
+        }
+    } else if (chosen == refreshAction) {
+        remote_->refresh();
+    }
+}
+
 // ---- transfer queue -----------------------------------------------------
 
 void MainWindow::enqueueUploads() {
@@ -332,29 +410,40 @@ void MainWindow::enqueueUploads() {
     }
     const QModelIndexList rows = left_->selectionModel()->selectedRows(0);
     if (rows.isEmpty()) {
-        statusBar()->showMessage("未选中本地文件", 4000);
+        statusBar()->showMessage("未选中本地条目", 4000);
         return;
     }
     const auto ci = remote_->connInfo();
+    const std::string remoteDir = remote_->currentPath();
     for (const QModelIndex& proxyIdx : rows) {
         const QModelIndex src = proxy_->mapToSource(proxyIdx);
-        if (model_->isDir(src)) continue;   // file transfers only (M3: dirs)
         const QString localPath = model_->pathAt(src);
+        // Remote target: current remote dir + base name.
+        std::string name = localPath.toStdString();
+        const std::size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) name = name.substr(slash + 1);
+
         TransferRequest req;
         req.direction = TransferDirection::Upload;
         req.protocol = ci.isSftp ? BackendKind::Sftp : BackendKind::Ftp;
         req.localPath = localPath.toStdString();
-        // Remote target: current remote dir + file base name.
-        std::string name = localPath.toStdString();
-        const std::size_t slash = name.find_last_of("/\\");
-        if (slash != std::string::npos) name = name.substr(slash + 1);
-        const std::string remoteDir = remote_->currentPath();
         req.remotePath = (remoteDir.empty() || remoteDir == ".")
             ? name : remoteDir + "/" + name;
         req.ftp = ci.ftp;
         req.ssh = ci.ssh;
         req.pushCommandTemplate = ci.pushCmdTemplate;
-        queue_->enqueue(std::move(req));
+
+        if (model_->isDir(src)) {
+            // Recursive upload: one job per file under the tree.
+            std::string err;
+            queue_->enqueueTree(std::move(req), &err);
+            if (!err.empty()) {
+                statusBar()->showMessage(
+                    QString::fromStdString("递归上传失败: " + err), 8000);
+            }
+        } else {
+            queue_->enqueue(std::move(req));
+        }
     }
     transferDock_->show();
 }
@@ -366,14 +455,13 @@ void MainWindow::enqueueDownloads() {
     }
     const QModelIndexList rows = rightTable_->selectionModel()->selectedRows(0);
     if (rows.isEmpty()) {
-        statusBar()->showMessage("未选中远端文件", 4000);
+        statusBar()->showMessage("未选中远端条目", 4000);
         return;
     }
     const auto ci = remote_->connInfo();
     std::string localDir = model_->currentDirFullPath();
     for (const QModelIndex& proxyIdx : rows) {
         const QModelIndex src = remoteProxy_->mapToSource(proxyIdx);
-        if (remote_->isDir(src)) continue;
         const std::string remotePath = remote_->pathAt(src);
         const std::size_t slash = remotePath.find_last_of('/');
         const std::string name = slash == std::string::npos
@@ -385,7 +473,17 @@ void MainWindow::enqueueDownloads() {
         req.localPath = localDir + "\\" + name;
         req.ftp = ci.ftp;
         req.ssh = ci.ssh;
-        queue_->enqueue(std::move(req));
+
+        if (remote_->isDir(src)) {
+            std::string err;
+            queue_->enqueueTree(std::move(req), &err);
+            if (!err.empty()) {
+                statusBar()->showMessage(
+                    QString::fromStdString("递归下载失败: " + err), 8000);
+            }
+        } else {
+            queue_->enqueue(std::move(req));
+        }
     }
     transferDock_->show();
 }
@@ -408,7 +506,10 @@ void MainWindow::onTransferEvent(const TransferEvent& ev) {
     QString text = QString("%1 [job %2] %3 %4%")
                        .arg(arrow)
                        .arg((unsigned long long)ev.jobId)
-                       .arg(ev.mode == TransferMode::Compress ? "压缩" : "直传")
+                       .arg(ev.mode == TransferMode::Compress
+                                    ? "压缩"
+                                    : ev.mode == TransferMode::Ftz1 ? "FTZ"
+                                                                    : "直传")
                        .arg(pct, 0, 'f', 1);
     if (ev.kind == TransferEvent::Kind::Progress ||
         ev.kind == TransferEvent::Kind::Finished) {

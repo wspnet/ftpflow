@@ -15,11 +15,13 @@ qt_add_executable(ftpflow_app
     src/local_fs_model.cpp
     src/remote_fs_model.cpp
     src/connect_dialog.cpp
+    src/site_store.cpp
 )
 target_link_libraries(ftpflow_app PRIVATE
     ftpflow_core
     Qt6::Widgets
     Qt6::Concurrent
+    advapi32
 )
 target_compile_features(ftpflow_app PRIVATE cxx_std_17)
 set_target_properties(ftpflow_app PROPERTIES
