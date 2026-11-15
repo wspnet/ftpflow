@@ -127,6 +127,10 @@ def main() -> int:
     parser.add_argument("--no-gui", action="store_true",
                         help="configure with FTPFLOW_BUILD_GUI=OFF")
     parser.add_argument("--configure-only", action="store_true")
+    parser.add_argument("--vcpkg-concurrency", type=int, default=1,
+                        help="vcpkg dependency build parallelism "
+                             "(VCPKG_MAX_CONCURRENCY); 1 = serial nmake, "
+                             "skips jom which deadlocks on this machine")
     args = parser.parse_args()
 
     msvc = find_msvc()
@@ -145,6 +149,13 @@ def main() -> int:
         env["VCPKG_ROOT"] = str(vcpkg_root)
         env["VCPKG_DEFAULT_TRIPLET"] = "x64-windows-static-ftpflow"
         env["VCPKG_OVERLAY_TRIPLETS"] = str(ROOT / "triplets")
+        # jom's parallel child coordination deadlocks on this machine
+        # (cl.exe spawns, runs ~16ms, then blocks forever; three observed
+        # freezes mid openssl build). vcpkg_build_nmake skips jom entirely
+        # when VCPKG_CONCURRENCY == 1 and falls back to serial nmake --
+        # slower but reliable. vcpkg-tool maps env VCPKG_MAX_CONCURRENCY
+        # to the CMake variable VCPKG_CONCURRENCY.
+        env["VCPKG_MAX_CONCURRENCY"] = str(args.vcpkg_concurrency)
 
     build_dir = ROOT / "build" / preset
     if args.clean and build_dir.exists():

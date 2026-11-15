@@ -21,8 +21,8 @@ namespace ftpflow {
 #if defined(FTPFLOW_HAVE_LIBSSH2)
 
 struct SshExec::Impl {
-    libssh2_session* session = nullptr;
-    libssh2_channel* channel = nullptr;
+    LIBSSH2_SESSION* session = nullptr;
+    LIBSSH2_CHANNEL* channel = nullptr;
     SOCKET sock = INVALID_SOCKET;
     std::vector<std::uint8_t> pendingWrite;  // unwritten stdin backlog
 
@@ -63,19 +63,19 @@ bool waitSocket(SOCKET s, bool writable, int timeoutMs) {
     return rc > 0;
 }
 
-SshResult mapSshErr(SshStatus st, const char* what, libssh2_session* sess) {
+SshResult mapSshErr(SshStatus st, const char* what, LIBSSH2_SESSION* sess) {
     SshResult r;
     r.status = st;
-    char buf[256] = {0};
     int err = 0;
+    std::string msg;
     if (sess) {
         err = libssh2_session_last_errno(sess);
-        if (libssh2_session_last_error(sess, buf, nullptr, 0) != 0 && buf[0]) {
-            // buf already holds the message
-        }
+        char* raw = nullptr;  // points at libssh2-internal storage when ok
+        libssh2_session_last_error(sess, &raw, nullptr, 0);
+        if (raw) msg = raw;
     }
     r.libssh2Errno = err;
-    r.message = std::string(what) + (buf[0] ? ": " : "") + buf;
+    r.message = std::string(what) + (msg.empty() ? "" : ": ") + msg;
     return r;
 }
 
@@ -154,8 +154,11 @@ SshResult SshExec::open(const SshEndpoint& ep,
 
     // Authentication: private key when provided, else password.
     if (!ep.privateKeyPem.empty()) {
+        // publickeyfiledata = nullptr: libssh2 extracts the public key
+        // from the private key blob itself.
         while ((rc = libssh2_userauth_publickey_frommemory(
-                    impl_->session, ep.user.c_str(), (unsigned)ep.user.size(),
+                    impl_->session, ep.user.c_str(), ep.user.size(),
+                    nullptr, 0,
                     ep.privateKeyPem.data(), ep.privateKeyPem.size(),
                     ep.privateKeyPassphrase.empty()
                         ? nullptr : ep.privateKeyPassphrase.c_str()))

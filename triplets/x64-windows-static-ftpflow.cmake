@@ -10,6 +10,10 @@
 set(VCPKG_TARGET_ARCHITECTURE x64)
 set(VCPKG_CRT_LINKAGE static)
 set(VCPKG_LIBRARY_LINKAGE static)
+# ftpflow only ever links release dependencies (app + CLI are /MT release);
+# skipping vcpkg's default debug build of every port roughly halves
+# dependency build time (OpenSSL alone saves ~10+ minutes).
+set(VCPKG_BUILD_TYPE release)
 
 set(VCPKG_ENV_PASSTHROUGH
     "INCLUDE;LIB;PATH;WindowsSDKDir;WindowsSDKVersion;UniversalCRTSdkDir;VCToolsInstallDir;VCINSTALLDir")
