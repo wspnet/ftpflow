@@ -3,6 +3,8 @@
 
 #include <QtCore/QDateTime>
 #include <QtCore/QMetaObject>
+#include <QtCore/QMimeData>
+#include <QtCore/QSet>
 
 #include <cstdio>
 
@@ -308,6 +310,42 @@ void RemoteFsModel::fetchMore(const QModelIndex& parent) {
     t.startAfter = lastOfCurrentPage_;   // SFTP cursor; FTP ignores it
     t.generation = navGen_;
     pushTask(std::move(t));
+}
+
+// ---- drag source -----------------------------------------------------------
+
+// Custom MIME carrying remote absolute paths (one per line, "dir" suffix on
+// directories). Distinct from the local MIME so each pane only accepts the
+// other's drops.
+const char* kRemotePathsMime = "application/x-ftpflow-remote-paths";
+
+Qt::ItemFlags RemoteFsModel::flags(const QModelIndex& idx) const {
+    Qt::ItemFlags f = QAbstractTableModel::flags(idx);
+    if (idx.isValid()) f |= Qt::ItemIsDragEnabled;
+    return f;
+}
+
+QStringList RemoteFsModel::mimeTypes() const {
+    return {QLatin1String(kRemotePathsMime)};
+}
+
+QMimeData* RemoteFsModel::mimeData(const QModelIndexList& indexes) const {
+    QStringList paths;
+    QSet<int> seenRows;
+    for (const QModelIndex& idx : indexes) {
+        if (!idx.isValid() || idx.column() != ColName) continue;
+        if (seenRows.contains(idx.row())) continue;
+        seenRows.insert(idx.row());
+        std::string p = pathAt(idx);
+        if (p.empty()) continue;
+        if (isDir(idx)) p += "/";   // trailing slash marks a directory
+        paths << QString::fromStdString(p);
+    }
+    if (paths.isEmpty()) return nullptr;
+    auto* mime = new QMimeData;
+    mime->setData(QLatin1String(kRemotePathsMime),
+                  paths.join('\n').toUtf8());
+    return mime;
 }
 
 // ---- worker thread --------------------------------------------------------

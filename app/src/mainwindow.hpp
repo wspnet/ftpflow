@@ -49,6 +49,7 @@ private slots:
     void onConnectionLost(const QString& msg);
     void onHostKeyUnknown(const QString& fingerprint, const QString& host,
                           quint16 port, const QString& keyHex);
+    void renameRemoteSelected();   // F2 inline rename of the current row
 
     // Transfer dock interactions.
     void onTransferContextMenu(const QPoint& pos);
@@ -62,10 +63,20 @@ private:
     void showRoot(const std::string& root);
     void refreshStatusBar();
 
+    // Drag & drop: panes accept the other's drops (local->remote = upload,
+    // remote->local = download). Handled here rather than in the models so
+    // the transfer queue stays in one place.
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void handleLocalDrop(const QStringList& remotePaths);
+    void handleRemoteDrop(const QStringList& localPaths);
+
     // Transfer queue plumbing (events arrive on worker threads).
     void onTransferEvent(const TransferEvent& ev);
     void enqueueUploads();
     void enqueueDownloads();
+    // Drop-target variants: enqueue a specific set of paths.
+    void enqueueLocalToRemote(const QStringList& localPaths);
+    void enqueueRemoteToLocal(const QStringList& remotePaths);
 
     LocalFsModel* model_ = nullptr;
     QSortFilterProxyModel* proxy_ = nullptr;

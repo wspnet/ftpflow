@@ -63,6 +63,11 @@ public:
     bool canFetchMore(const QModelIndex& parent) const override;
     void fetchMore(const QModelIndex& parent) override;
 
+    // Drag source: expose selected entries as local file paths (copy).
+    Qt::ItemFlags flags(const QModelIndex& idx) const override;
+    QStringList mimeTypes() const override;
+    QMimeData* mimeData(const QModelIndexList& indexes) const override;
+
 signals:
     void verdictsReady();
 

@@ -2,7 +2,9 @@
 #include "mainwindow.hpp"
 
 #include <QAction>
+#include <QDropEvent>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -11,10 +13,12 @@
 #include <QListWidget>
 #include <QMenu>
 #include <QMessageBox>
+#include <QMimeData>
 #include <QPushButton>
 #include <QProgressBar>
 #include <QSortFilterProxyModel>
 #include <QSpinBox>
+#include <QShortcut>
 #include <QSplitter>
 #include <QStatusBar>
 #include <QTableView>
@@ -167,6 +171,13 @@ void MainWindow::buildUi() {
     left_->horizontalHeader()->setSortIndicator(0, Qt::AscendingOrder);
     leftLay->addWidget(leftTitle);
     leftLay->addWidget(left_, 1);
+    // Drag & drop: local pane is a drag source (uploads) and drop target
+    // (downloads from remote).
+    left_->setDragEnabled(true);
+    left_->setAcceptDrops(true);
+    left_->setDragDropMode(QAbstractItemView::DragDrop);
+    left_->setDefaultDropAction(Qt::CopyAction);
+    left_->viewport()->installEventFilter(this);
     connect(left_, &QTableView::doubleClicked, this,
             [this](const QModelIndex& idx) {
                 onActivated(proxy_->mapToSource(idx));
@@ -205,6 +216,15 @@ void MainWindow::buildUi() {
     remotePathEdit_ = new QLineEdit(remoteBar);
     remotePathEdit_->setPlaceholderText("未连接（点“连接...”打开远端）");
     remotePathEdit_->setReadOnly(true);
+    remotePathEdit_->setClearButtonEnabled(true);
+    // Address-bar navigation: type an absolute remote path and press Enter
+    // (XTerminal-style). Only meaningful once connected.
+    connect(remotePathEdit_, &QLineEdit::returnPressed, this, [this] {
+        if (!remote_->isConnected()) return;
+        const QString p = remotePathEdit_->text().trimmed();
+        if (p.isEmpty()) return;
+        remote_->enterDir(p.toStdString());
+    });
     connectBtn_ = new QPushButton("连接...", remoteBar);
     disconnectBtn_ = new QPushButton("断开", remoteBar);
     auto* remoteUpBtn = new QPushButton("向上", remoteBar);
@@ -238,6 +258,18 @@ void MainWindow::buildUi() {
     rightLay->addWidget(rightTitle);
     rightLay->addWidget(remoteBar);
     rightLay->addWidget(rightTable_, 1);
+    // Drag & drop: remote pane is a drag source (downloads) and drop target
+    // (uploads from local).
+    rightTable_->setDragEnabled(true);
+    rightTable_->setAcceptDrops(true);
+    rightTable_->setDragDropMode(QAbstractItemView::DragDrop);
+    rightTable_->setDefaultDropAction(Qt::CopyAction);
+    rightTable_->viewport()->installEventFilter(this);
+    // F2 inline rename (XTerminal / Explorer convention).
+    auto* renameShortcut = new QShortcut(QKeySequence(Qt::Key_F2), rightTable_);
+    renameShortcut->setContext(Qt::WidgetShortcut);
+    connect(renameShortcut, &QShortcut::activated, this,
+            &MainWindow::renameRemoteSelected);
 
     connect(connectBtn_, &QPushButton::clicked, this, &MainWindow::onConnect);
     connect(disconnectBtn_, &QPushButton::clicked, this,
@@ -418,12 +450,14 @@ void MainWindow::onDisconnect() {
     remote_->disconnect();
     connectBtn_->setEnabled(true);
     disconnectBtn_->setEnabled(false);
+    remotePathEdit_->setReadOnly(true);
 }
 
 void MainWindow::onRemoteConnected() {
     reconnectTimer_->stop();
     connectBtn_->setEnabled(false);
     disconnectBtn_->setEnabled(true);
+    remotePathEdit_->setReadOnly(false);
     remotePathEdit_->setText(QString::fromStdString(remote_->currentPath()));
     refreshStatusBar();
 }
@@ -431,6 +465,7 @@ void MainWindow::onRemoteConnected() {
 void MainWindow::onRemoteConnectFailed(const QString& msg) {
     connectBtn_->setEnabled(true);
     disconnectBtn_->setEnabled(false);
+    remotePathEdit_->setReadOnly(true);
     remotePathEdit_->setText("未连接");
     statusBar()->showMessage(msg, 8000);
 }
@@ -440,6 +475,7 @@ void MainWindow::onHostKeyUnknown(const QString& fingerprint,
                                   const QString& keyHex) {
     connectBtn_->setEnabled(true);
     disconnectBtn_->setEnabled(false);
+    remotePathEdit_->setReadOnly(true);
     remotePathEdit_->setText("未连接");
     const QString detail =
         QString("主机 %1:%2 的 SSH 密钥尚未受信任。\n\n"
@@ -468,6 +504,7 @@ void MainWindow::onConnectionLost(const QString& msg) {
     // reconnect (reusing the saved connection info). If it fails, the normal
     // connectFailed path restores the "未连接" UI for a manual retry.
     disconnectBtn_->setEnabled(false);
+    remotePathEdit_->setReadOnly(true);
     remotePathEdit_->setText("连接已断开，准备重连...");
     statusBar()->showMessage(
         QString("连接已断开：%1（自动重连中...）").arg(msg), 8000);
@@ -523,14 +560,7 @@ void MainWindow::onRemoteContextMenu(const QPoint& pos) {
             remote_->makeDir(name.trimmed().toStdString());
         }
     } else if (chosen == renameAction) {
-        bool ok = false;
-        const QString oldName =
-            QString::fromStdString(remote_->nameAt(idx));
-        const QString name = QInputDialog::getText(
-            this, "重命名", "新名称:", QLineEdit::Normal, oldName, &ok);
-        if (ok && !name.trimmed().isEmpty() && name != oldName) {
-            remote_->renameEntry(idx, name.trimmed().toStdString());
-        }
+        renameRemoteSelected();
     } else if (chosen == removeAction) {
         QModelIndexList rows = rightTable_->selectionModel()->selectedRows(0);
         if (rows.isEmpty()) rows = {proxyIdx};
@@ -558,7 +588,154 @@ void MainWindow::onRemoteContextMenu(const QPoint& pos) {
     }
 }
 
+void MainWindow::renameRemoteSelected() {
+    if (!remote_->isConnected()) return;
+    const QModelIndex proxyIdx = rightTable_->currentIndex();
+    if (!proxyIdx.isValid()) return;
+    const QModelIndex idx = remoteProxy_->mapToSource(proxyIdx);
+    if (!idx.isValid()) return;
+    bool ok = false;
+    const QString oldName = QString::fromStdString(remote_->nameAt(idx));
+    const QString name = QInputDialog::getText(
+        this, "重命名", "新名称:", QLineEdit::Normal, oldName, &ok);
+    if (ok && !name.trimmed().isEmpty() && name != oldName) {
+        remote_->renameEntry(idx, name.trimmed().toStdString());
+    }
+}
+
+// ---- drag & drop -----------------------------------------------------------
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    if (event->type() == QEvent::DragEnter ||
+        event->type() == QEvent::DragMove) {
+        auto* de = static_cast<QDragEnterEvent*>(event);
+        const QMimeData* m = de->mimeData();
+        const bool onRemote = watched == rightTable_->viewport();
+        const bool onLocal = watched == left_->viewport();
+        const bool ok =
+            (onRemote && m->hasFormat("application/x-ftpflow-local-paths")) ||
+            (onLocal && m->hasFormat("application/x-ftpflow-remote-paths"));
+        if (ok) {
+            de->acceptProposedAction();
+            return true;   // swallow; we handle the drop ourselves
+        }
+        return false;
+    }
+    if (event->type() == QEvent::Drop) {
+        auto* de = static_cast<QDropEvent*>(event);
+        const QMimeData* m = de->mimeData();
+        if (watched == rightTable_->viewport() &&
+            m->hasFormat("application/x-ftpflow-local-paths")) {
+            const QStringList paths = QString::fromUtf8(
+                m->data("application/x-ftpflow-local-paths"))
+                .split('\n', Qt::SkipEmptyParts);
+            de->acceptProposedAction();
+            enqueueLocalToRemote(paths);
+            return true;
+        }
+        if (watched == left_->viewport() &&
+            m->hasFormat("application/x-ftpflow-remote-paths")) {
+            const QStringList paths = QString::fromUtf8(
+                m->data("application/x-ftpflow-remote-paths"))
+                .split('\n', Qt::SkipEmptyParts);
+            de->acceptProposedAction();
+            enqueueRemoteToLocal(paths);
+            return true;
+        }
+        return false;
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
 // ---- transfer queue -----------------------------------------------------
+
+// Shared helper: build a TransferRequest pre-filled with the current remote
+// connection credentials (used by both the buttons and the drop handlers).
+namespace {
+TransferRequest makeRequest(const RemoteFsModel::ConnInfo& ci) {
+    TransferRequest req;
+    req.protocol = ci.isSftp ? BackendKind::Sftp : BackendKind::Ftp;
+    req.ftp = ci.ftp;
+    req.ssh = ci.ssh;
+    req.pushCommandTemplate = ci.pushCmdTemplate;
+    req.siteName = ci.siteName;
+    if (ci.isSftp && !ci.knownHostsPath.empty()) {
+        KnownHosts kh(ci.knownHostsPath);
+        req.trustedHostKeyHex = kh.trustedHexFor(ci.ssh.host, ci.ssh.port);
+    }
+    return req;
+}
+}  // namespace
+
+void MainWindow::enqueueLocalToRemote(const QStringList& localPaths) {
+    if (!remote_->isConnected()) {
+        statusBar()->showMessage("请先连接远端", 4000);
+        return;
+    }
+    if (localPaths.isEmpty()) return;
+    const auto ci = remote_->connInfo();
+    const std::string remoteDir = remote_->currentPath();
+    for (const QString& localPath : localPaths) {
+        const QFileInfo fi(localPath);
+        if (!fi.exists()) continue;
+        std::string name = localPath.toStdString();
+        const std::size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) name = name.substr(slash + 1);
+
+        TransferRequest req = makeRequest(ci);
+        req.direction = TransferDirection::Upload;
+        req.localPath = localPath.toStdString();
+        req.remotePath = (remoteDir.empty() || remoteDir == ".")
+            ? name : remoteDir + "/" + name;
+
+        if (fi.isDir()) {
+            std::string err;
+            queue_->enqueueTree(std::move(req), &err);
+            if (!err.empty())
+                statusBar()->showMessage(
+                    QString::fromStdString("递归上传失败: " + err), 8000);
+        } else {
+            queue_->enqueue(std::move(req));
+        }
+    }
+    transferDock_->show();
+}
+
+void MainWindow::enqueueRemoteToLocal(const QStringList& remotePaths) {
+    if (!remote_->isConnected()) {
+        statusBar()->showMessage("请先连接远端", 4000);
+        return;
+    }
+    if (remotePaths.isEmpty()) return;
+    const auto ci = remote_->connInfo();
+    const std::string localDir = model_->currentDirFullPath();
+    for (const QString& remotePath : remotePaths) {
+        // A trailing slash marks a directory (set by the drag source).
+        QString rp = remotePath;
+        const bool isDir = rp.endsWith('/');
+        if (isDir) rp.chop(1);
+        const std::string rpath = rp.toStdString();
+        const std::size_t slash = rpath.find_last_of('/');
+        const std::string name = slash == std::string::npos
+            ? rpath : rpath.substr(slash + 1);
+
+        TransferRequest req = makeRequest(ci);
+        req.direction = TransferDirection::Download;
+        req.remotePath = rpath;
+        req.localPath = localDir + "\\" + name;
+
+        if (isDir) {
+            std::string err;
+            queue_->enqueueTree(std::move(req), &err);
+            if (!err.empty())
+                statusBar()->showMessage(
+                    QString::fromStdString("递归下载失败: " + err), 8000);
+        } else {
+            queue_->enqueue(std::move(req));
+        }
+    }
+    transferDock_->show();
+}
 
 void MainWindow::enqueueUploads() {
     if (!remote_->isConnected()) {
@@ -570,44 +747,13 @@ void MainWindow::enqueueUploads() {
         statusBar()->showMessage("未选中本地条目", 4000);
         return;
     }
-    const auto ci = remote_->connInfo();
-    const std::string remoteDir = remote_->currentPath();
+    QStringList paths;
     for (const QModelIndex& proxyIdx : rows) {
         const QModelIndex src = proxy_->mapToSource(proxyIdx);
-        const QString localPath = model_->pathAt(src);
-        // Remote target: current remote dir + base name.
-        std::string name = localPath.toStdString();
-        const std::size_t slash = name.find_last_of("/\\");
-        if (slash != std::string::npos) name = name.substr(slash + 1);
-
-        TransferRequest req;
-        req.direction = TransferDirection::Upload;
-        req.protocol = ci.isSftp ? BackendKind::Sftp : BackendKind::Ftp;
-        req.localPath = localPath.toStdString();
-        req.remotePath = (remoteDir.empty() || remoteDir == ".")
-            ? name : remoteDir + "/" + name;
-        req.ftp = ci.ftp;
-        req.ssh = ci.ssh;
-        req.pushCommandTemplate = ci.pushCmdTemplate;
-        req.siteName = ci.siteName;
-        if (ci.isSftp && !ci.knownHostsPath.empty()) {
-            KnownHosts kh(ci.knownHostsPath);
-            req.trustedHostKeyHex = kh.trustedHexFor(ci.ssh.host, ci.ssh.port);
-        }
-
-        if (model_->isDir(src)) {
-            // Recursive upload: one job per file under the tree.
-            std::string err;
-            queue_->enqueueTree(std::move(req), &err);
-            if (!err.empty()) {
-                statusBar()->showMessage(
-                    QString::fromStdString("递归上传失败: " + err), 8000);
-            }
-        } else {
-            queue_->enqueue(std::move(req));
-        }
+        const QString p = model_->pathAt(src);
+        if (!p.isEmpty()) paths << p;
     }
-    transferDock_->show();
+    enqueueLocalToRemote(paths);
 }
 
 void MainWindow::enqueueDownloads() {
@@ -620,39 +766,15 @@ void MainWindow::enqueueDownloads() {
         statusBar()->showMessage("未选中远端条目", 4000);
         return;
     }
-    const auto ci = remote_->connInfo();
-    std::string localDir = model_->currentDirFullPath();
+    QStringList paths;
     for (const QModelIndex& proxyIdx : rows) {
         const QModelIndex src = remoteProxy_->mapToSource(proxyIdx);
-        const std::string remotePath = remote_->pathAt(src);
-        const std::size_t slash = remotePath.find_last_of('/');
-        const std::string name = slash == std::string::npos
-            ? remotePath : remotePath.substr(slash + 1);
-        TransferRequest req;
-        req.direction = TransferDirection::Download;
-        req.protocol = ci.isSftp ? BackendKind::Sftp : BackendKind::Ftp;
-        req.remotePath = remotePath;
-        req.localPath = localDir + "\\" + name;
-        req.ftp = ci.ftp;
-        req.ssh = ci.ssh;
-        req.siteName = ci.siteName;
-        if (ci.isSftp && !ci.knownHostsPath.empty()) {
-            KnownHosts kh(ci.knownHostsPath);
-            req.trustedHostKeyHex = kh.trustedHexFor(ci.ssh.host, ci.ssh.port);
-        }
-
-        if (remote_->isDir(src)) {
-            std::string err;
-            queue_->enqueueTree(std::move(req), &err);
-            if (!err.empty()) {
-                statusBar()->showMessage(
-                    QString::fromStdString("递归下载失败: " + err), 8000);
-            }
-        } else {
-            queue_->enqueue(std::move(req));
-        }
+        std::string p = remote_->pathAt(src);
+        if (p.empty()) continue;
+        if (remote_->isDir(src)) p += "/";
+        paths << QString::fromStdString(p);
     }
-    transferDock_->show();
+    enqueueRemoteToLocal(paths);
 }
 
 void MainWindow::onTransferEvent(const TransferEvent& ev) {

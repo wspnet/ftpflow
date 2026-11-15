@@ -4,6 +4,9 @@
 #include <QtConcurrent/QtConcurrentMap>
 #include <QtCore/QDateTime>
 #include <QtCore/QMetaObject>
+#include <QtCore/QMimeData>
+#include <QtCore/QSet>
+#include <QtCore/QUrl>
 #include <cstdio>
 #include <cstring>
 
@@ -301,6 +304,44 @@ std::string LocalFsModel::relativeAt(const QModelIndex& idx) const {
     const Entry& e = entryAt(idx.row());
     return currentDir_.empty()
         ? e.name : currentDir_ + "/" + e.name;
+}
+
+// ---- drag source -----------------------------------------------------------
+
+// Custom MIME carrying local absolute paths (one per line). Distinct from
+// text/uri-list so the remote pane only accepts local drops and vice versa.
+const char* kLocalPathsMime = "application/x-ftpflow-local-paths";
+
+Qt::ItemFlags LocalFsModel::flags(const QModelIndex& idx) const {
+    Qt::ItemFlags f = QAbstractTableModel::flags(idx);
+    if (idx.isValid()) f |= Qt::ItemIsDragEnabled;
+    return f;
+}
+
+QStringList LocalFsModel::mimeTypes() const {
+    return {QLatin1String(kLocalPathsMime), QStringLiteral("text/uri-list")};
+}
+
+QMimeData* LocalFsModel::mimeData(const QModelIndexList& indexes) const {
+    QStringList paths;
+    QSet<int> seenRows;
+    for (const QModelIndex& idx : indexes) {
+        if (!idx.isValid() || idx.column() != ColName) continue;
+        if (seenRows.contains(idx.row())) continue;
+        seenRows.insert(idx.row());
+        const QString p = pathAt(idx);
+        if (!p.isEmpty()) paths << p;
+    }
+    if (paths.isEmpty()) return nullptr;
+    auto* mime = new QMimeData;
+    mime->setData(QLatin1String(kLocalPathsMime),
+                  paths.join('\n').toUtf8());
+    // Also provide standard URI list so dropping onto the OS shell works.
+    QList<QUrl> urls;
+    for (const QString& p : paths)
+        urls << QUrl::fromLocalFile(p);
+    mime->setUrls(urls);
+    return mime;
 }
 
 }  // namespace ftpflow

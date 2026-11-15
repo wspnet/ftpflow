@@ -83,6 +83,11 @@ public:
     bool canFetchMore(const QModelIndex& parent) const override;
     void fetchMore(const QModelIndex& parent) override;
 
+    // Drag source: expose selected remote entries as remote paths (copy).
+    Qt::ItemFlags flags(const QModelIndex& idx) const override;
+    QStringList mimeTypes() const override;
+    QMimeData* mimeData(const QModelIndexList& indexes) const override;
+
 signals:
     void connected();
     void connectFailed(const QString& message);
