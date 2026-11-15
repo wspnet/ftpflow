@@ -8,13 +8,25 @@ add_executable(test_vfs_local test_vfs_local.cpp)
 target_link_libraries(test_vfs_local PRIVATE ftpflow_core)
 target_compile_features(test_vfs_local PRIVATE cxx_std_17)
 
+add_executable(test_compress_trial test_compress_trial.cpp)
+target_link_libraries(test_compress_trial PRIVATE ftpflow_core)
+target_compile_features(test_compress_trial PRIVATE cxx_std_17)
+
+# Benchmark tool (not a test): 100k-entry enumeration budget from the
+# blueprint. Run manually: bench_list.exe [dir] [--create N]
+add_executable(bench_list bench_list.cpp)
+target_link_libraries(bench_list PRIVATE ftpflow_core)
+target_compile_features(bench_list PRIVATE cxx_std_17)
+
 add_test(NAME compress_decide COMMAND test_compress_decide)
 add_test(NAME vfs_local COMMAND test_vfs_local)
+add_test(NAME compress_trial COMMAND test_compress_trial)
 
 # Convenience target: build + run all tests in one step.
 add_custom_target(run_tests
     COMMAND $<TARGET_FILE:test_compress_decide>
     COMMAND $<TARGET_FILE:test_vfs_local>
-    DEPENDS test_compress_decide test_vfs_local
+    COMMAND $<TARGET_FILE:test_compress_trial>
+    DEPENDS test_compress_decide test_vfs_local test_compress_trial
     USES_TERMINAL
 )

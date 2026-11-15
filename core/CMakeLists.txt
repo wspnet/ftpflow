@@ -17,6 +17,7 @@ target_sources(ftpflow_core PRIVATE
     src/version.cpp
     src/vfs_local.cpp
     src/compress_decide.cpp
+    src/compress_trial.cpp
     src/backend_stubs.cpp
 )
 

@@ -2,16 +2,19 @@
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "ftpflow",
   "version": "0.1.0",
+  "builtin-baseline": "8f363bdc11359ede4bc51e5eb32a2617538049c8",
   "dependencies": [
-    { "name": "libcurl", "default-features": false, "features": [ "schannel", "multi" ] },
-    { "name": "libssh2", "default-features": false, "features": [ "wincng" ] },
-    { "name": "zstd" }
-  ],
-  "builtin-baseline": "",
-  "overrides": [],
-  "notes": [
-    "Used by the 'release-full' CMake preset. The skeleton 'release' preset",
-    "builds with zero third-party dependencies. Pin 'builtin-baseline' to a",
-    "vcpkg commit hash before first real use (see README M0 checklist)."
+    {
+      "$comment": "Default 'ssl' feature selects schannel on Windows -- no OpenSSL for FTPS.",
+      "name": "curl"
+    },
+    {
+      "$comment": "vcpkg's libssh2 port has no WinCNG feature switch on Windows, so it defaults to openssl+zlib. Re-evaluate with a custom overlay port after the M0 exec-channel matrix; the core CMake guard (FTPFLOW_WITH_LIBSSH2) keeps the backend swappable.",
+      "name": "libssh2"
+    },
+    {
+      "$comment": "BSD-3-Clause side of the dual license -- record in THIRD_PARTY_NOTICES.",
+      "name": "zstd"
+    }
   ]
 }

@@ -19,9 +19,9 @@ ftpflow/
 │   └── src/         判定 L1/L2/L3 已实现；L4/L5 与协议引擎随 M0 接入
 ├── cli/             ftpcli.exe —— 与桌面端共用 core.lib
 ├── app/             Qt Widgets 桌面壳（未装 Qt 时自动跳过）
-├── tests/           零依赖断言式测试
-├── tools/build_native.py   一键构建（vswhere → vcvars64 → CMake+Ninja）
-└── vcpkg.json       M0 协议依赖清单（libcurl-schannel / libssh2-wincng / zstd）
+├── tests/           零依赖断言式测试（70 项）+ bench_list 基准工具
+├── tools/build_native.py   一键构建（vswhere → 直组装 MSVC/SDK 环境 → CMake+Ninja）
+└── vcpkg.json       M0 协议依赖清单（baseline 已锁 8f363bd）
 ```
 
 ## 快速开始
@@ -45,12 +45,12 @@ build\release\cli\ftpcli.exe info .
 
 ## M0 Spike 待办（两周期，对应方案第 12 章）
 
-1. vcpkg 装齐 `libcurl[schannel] / libssh2[wincng] / zstd`，锁定 baseline 提交，`--full` 预设打通。
-2. 判定 L4（zstd -1 试压）与 L5（带宽成本模型）接入，跑 1 万混合文件准确率。
-3. 本地后端换 `FindFirstFileEx(LARGE_FETCH)` + IOCP 读写，10 万条目首屏 ≤250 ms 实测。
-4. libssh2 exec 单流：远端 agent 投放 + zstd 边压边传 + 真实主机矩阵（含受限 sftp 账户）量覆盖率。
-5. FTZ1 分块容器原型：块级 xxHash3 + SQLite 断点游标，1 GB 中断续传零误差。
-6. Qt 6.12 在线安装器装 `MSVC 2022 x64_64` 组件，GUI 目标点亮。
+1. [x] vcpkg 清单锁定 baseline `8f363bd`（curl 默认 ssl=Windows schannel；libssh2 端口无 WinCNG 开关暂用 openssl 后端，exec 矩阵实测后再决定是否 overlay 切换；zstd）。`--full` 预设待依赖编译完成后打通。
+2. [x] 判定 L4 试压（先落 Windows 原生 ntdll XPRESS_HUFF 零依赖路径，zstd -1 并列待依赖就绪）+ L5 带宽成本模型 `(1−r)S/B > margin·(S/C + rS/D)`。70 项断言全绿；33 MB 真实日志实测：20 MiB/s 链路 COMPRESS（省 77%、CPU 回报 1380%），10 GbE STORE（回报 22%）。1 万混合文件准确率统计待做。
+3. [x] 10 万条目实测：`bench_list --create 100000`，首屏（含全量枚举+排序）45.8 ms cold / 40.7 ms warm，预算 300 ms。已知问题：每次 `list()` 重扫全目录，翻页全程 8.2 s → M1 做目录缓存 + ReadDirectoryChangesW 失效。
+4. [ ] libssh2 exec 单流：远端 agent 投放 + zstd 边压边传 + 真实主机矩阵（含受限 sftp 账户）量覆盖率。
+5. [ ] FTZ1 分块容器原型：块级 xxHash3 + SQLite 断点游标，1 GB 中断续传零误差。
+6. [ ] Qt 6.12 在线安装器装 `MSVC 2022 x64_64` 组件，GUI 目标点亮。
 
 ## 约定
 

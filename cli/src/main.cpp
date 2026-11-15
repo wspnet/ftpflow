@@ -2,6 +2,7 @@
 // Shares core.lib with the desktop shell: what the CLI can do, the GUI can
 // do, and vice versa (blueprint: one core, two front ends).
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -62,14 +63,30 @@ ftpflow::FileProbe probeFile(const std::string& path, bool withSample) {
 
 int cmdDecide(const std::vector<std::string>& args) {
     if (args.empty()) {
-        std::fprintf(stderr, "usage: ftpcli decide <file> [file...]\n");
+        std::fprintf(stderr,
+            "usage: ftpcli decide [--bw MIBPS] <file> [file...]\n"
+            "  runs the 5-stage funnel; --bw overrides the link speed used\n"
+            "  by the stage-5 cost model (default 20 MiB/s).\n");
+        return 2;
+    }
+    ftpflow::CostModel cm;
+    std::vector<std::string> paths;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--bw" && i + 1 < args.size()) {
+            cm.bandwidthBps = std::atof(args[++i].c_str()) * 1024.0 * 1024.0;
+        } else {
+            paths.push_back(args[i]);
+        }
+    }
+    if (paths.empty()) {
+        std::fprintf(stderr, "decide: no files given\n");
         return 2;
     }
     int rc = 0;
     std::printf("%-28s %-10s %-4s %s\n", "FILE", "VERDICT", "STG", "REASON");
-    for (const std::string& path : args) {
+    for (const std::string& path : paths) {
         ftpflow::FileProbe probe = probeFile(path, true);
-        ftpflow::Decision d = ftpflow::decideCompressibility(probe);
+        ftpflow::Decision d = ftpflow::decideFullFunnel(probe, cm);
         const char* v = d.verdict == ftpflow::Verdict::Compress ? "COMPRESS"
                       : d.verdict == ftpflow::Verdict::Store ? "STORE" : "???";
         std::printf("%-28s %-10s %-4d %s\n", probe.fileName.c_str(), v,
@@ -112,8 +129,8 @@ int main(int argc, char** argv) {
         std::printf(
             "ftpcli %s\n"
             "  ftpcli version\n"
-            "  ftpcli decide <file...>    run the compressibility funnel\n"
-            "  ftpcli info <dir>          directory listing smoke test\n",
+            "  ftpcli decide [--bw MIBPS] <file...>   run the 5-stage funnel\n"
+            "  ftpcli info <dir>                      directory listing smoke test\n",
             ftpflow::versionString());
         return args.empty() ? 2 : 0;
     }
