@@ -29,6 +29,8 @@
 
 #include "command_dialog.hpp"
 #include "connect_dialog.hpp"
+#include "remote_shell.hpp"
+#include "terminal_widget.hpp"
 #include "ftpflow/known_hosts.hpp"
 #include "ftpflow/protocol_status.hpp"
 #include "ftpflow/transfer_journal.hpp"
@@ -340,16 +342,20 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
     tab->refreshBtn = new QPushButton("刷新", remoteBar);
     tab->cmdBtn = new QPushButton("命令", remoteBar);
     tab->cmdBtn->setToolTip("在服务器上执行 shell 命令（复用当前连接）");
+    tab->termBtn = new QPushButton("终端", remoteBar);
+    tab->termBtn->setToolTip("打开交互式终端（SSH shell，支持 vi/top/颜色）");
     tab->disconnectBtn->setEnabled(false);
     tab->upBtn->setEnabled(false);
     tab->refreshBtn->setEnabled(false);
     tab->cmdBtn->setEnabled(false);
+    tab->termBtn->setEnabled(false);
     remoteBarLay->addWidget(tab->pathEdit, 1);
     remoteBarLay->addWidget(tab->connectBtn);
     remoteBarLay->addWidget(tab->disconnectBtn);
     remoteBarLay->addWidget(tab->upBtn);
     remoteBarLay->addWidget(tab->refreshBtn);
     remoteBarLay->addWidget(tab->cmdBtn);
+    remoteBarLay->addWidget(tab->termBtn);
 
     // Model/proxy are children of MainWindow (not the page) so they survive
     // independently; onTabClosed() deletes them explicitly.
@@ -370,7 +376,19 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
     tab->table->verticalHeader()->hide();
     tab->table->horizontalHeader()->setSortIndicator(0, Qt::AscendingOrder);
     pageLay->addWidget(remoteBar);
-    pageLay->addWidget(tab->table, 1);
+
+    // Vertical split: file list on top, interactive terminal below (hidden
+    // until the user opens it).
+    tab->termSplitter = new QSplitter(Qt::Vertical, page);
+    tab->termSplitter->setChildrenCollapsible(false);
+    tab->termSplitter->addWidget(tab->table);
+    tab->terminal = new TerminalWidget(tab->termSplitter);
+    tab->terminal->hide();
+    tab->termSplitter->addWidget(tab->terminal);
+    tab->termSplitter->setStretchFactor(0, 1);
+    tab->termSplitter->setStretchFactor(1, 0);
+    tab->termSplitter->setSizes({400, 160});
+    pageLay->addWidget(tab->termSplitter, 1);
 
     // Drag & drop + F2 rename (per tab).
     tab->table->setDragEnabled(true);
@@ -416,6 +434,18 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
     connect(tab->cmdBtn, &QPushButton::clicked, this, [this, tab] {
         onRemoteCommand(*tab);
     });
+    connect(tab->termBtn, &QPushButton::clicked, this, [this, tab] {
+        onRemoteTerminal(*tab);
+    });
+    // Terminal I/O wiring: keyboard -> shell, shell output -> terminal.
+    connect(tab->terminal, &TerminalWidget::dataReady, this,
+            [tab](const QByteArray& d) {
+                if (tab->shell) tab->shell->write(d);
+            });
+    connect(tab->terminal, &TerminalWidget::sizeChanged, this,
+            [tab](int cols, int rows) {
+                if (tab->shell) tab->shell->resize(cols, rows);
+            });
     connect(tab->table, &QTableView::doubleClicked, this, [this, tab](
             const QModelIndex& i) {
         if (!i.isValid() || !tab->model->isConnected()) return;
@@ -437,8 +467,9 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
         tab->disconnectBtn->setEnabled(true);
         tab->upBtn->setEnabled(true);
         tab->refreshBtn->setEnabled(true);
-        // Command execution only applies to SSH (FTP has no shell).
+        // Command execution + terminal only apply to SSH (FTP has no shell).
         tab->cmdBtn->setEnabled(tab->model->connInfo().isSftp);
+        tab->termBtn->setEnabled(tab->model->connInfo().isSftp);
         tab->pathEdit->setReadOnly(false);
         tab->pathEdit->setText(QString::fromStdString(tab->model->currentPath()));
         refreshStatusBar();
@@ -473,7 +504,10 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
         tab->upBtn->setEnabled(false);
         tab->refreshBtn->setEnabled(false);
         tab->cmdBtn->setEnabled(false);
+        tab->termBtn->setEnabled(false);
         tab->pathEdit->setText("未连接");
+        // Tear down any open terminal shell.
+        if (tab->shell) { tab->shell->stop(); }
     });
 
     const int idx = tabs_.size();
@@ -494,6 +528,7 @@ void MainWindow::onTabClosed(int index) {
     remoteTabs_->removeTab(index);   // deletes the page + its child widgets
     // model/proxy are MainWindow children (not page children): delete them
     // explicitly. Their destructors stop the worker thread cleanly.
+    if (t->shell) { t->shell->stop(); delete t->shell; t->shell = nullptr; }
     t->proxy->setSourceModel(nullptr);
     delete t->proxy;
     delete t->model;
@@ -574,6 +609,57 @@ void MainWindow::onRemoteCommand(RemoteTab& tab) {
     }
     CommandDialog dlg(ci, this);
     dlg.exec();
+}
+
+void MainWindow::onRemoteTerminal(RemoteTab& tab) {
+    if (!tab.model->isConnected()) {
+        statusBar()->showMessage("请先连接远端", 4000);
+        return;
+    }
+    const auto ci = tab.model->connInfo();
+    if (!ci.isSftp) {
+        statusBar()->showMessage("交互式终端仅支持 SSH/SFTP 连接", 4000);
+        return;
+    }
+
+    if (tab.termVisible) {
+        // Collapse the terminal.
+        tab.termVisible = false;
+        tab.terminal->hide();
+        tab.termBtn->setText("终端");
+        if (tab.shell) { tab.shell->stop(); }
+        return;
+    }
+
+    // Expand and (re)start the shell.
+    tab.termVisible = true;
+    tab.terminal->show();
+    tab.termBtn->setText("关闭终端");
+    tab.termSplitter->setSizes({tab.termSplitter->height() / 2,
+                                tab.termSplitter->height() / 2});
+
+    // (Re)create the shell for this connection.
+    if (tab.shell) {
+        tab.shell->deleteLater();
+        tab.shell = nullptr;
+    }
+    tab.shell = new RemoteShell(ci, this);
+    connect(tab.shell, &RemoteShell::output, tab.terminal,
+            &TerminalWidget::feed);
+    connect(tab.shell, &RemoteShell::finished, this,
+            [this, tab](const QString& msg) mutable {
+                if (!msg.isEmpty()) {
+                    statusBar()->showMessage(msg, 8000);
+                }
+                // The shell ended; collapse the terminal view.
+                tab.termBtn->setText("终端");
+                tab.termVisible = false;
+                tab.terminal->hide();
+                tab.shell->deleteLater();
+                tab.shell = nullptr;
+            });
+    tab.shell->start(tab.terminal->columns(), tab.terminal->rows());
+    tab.terminal->setFocus();
 }
 
 void MainWindow::onRemoteContextMenu(RemoteTab& tab, const QPoint& pos) {

@@ -25,10 +25,14 @@ class QSortFilterProxyModel;
 class QLabel;
 class QPushButton;
 class QSpinBox;
+class QSplitter;
 class QTabWidget;
 class QTimer;
 
 namespace ftpflow {
+
+class RemoteShell;
+class TerminalWidget;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -64,7 +68,13 @@ private:
         QPushButton* disconnectBtn = nullptr;
         QPushButton* upBtn = nullptr;
         QPushButton* refreshBtn = nullptr;
-        QPushButton* cmdBtn = nullptr;   // open the server-command panel
+        QPushButton* cmdBtn = nullptr;    // open the server-command panel
+        QPushButton* termBtn = nullptr;   // toggle the interactive terminal
+        // Interactive terminal (vertical split below the file list).
+        QSplitter* termSplitter = nullptr;
+        TerminalWidget* terminal = nullptr;
+        RemoteShell* shell = nullptr;
+        bool termVisible = false;
     };
 
     void buildUi();
@@ -78,6 +88,7 @@ private:
                           const QString& host, quint16 port,
                           const QString& keyHex);
     void onRemoteCommand(RemoteTab& tab);   // open the server-command panel
+    void onRemoteTerminal(RemoteTab& tab);  // toggle the interactive terminal
 
     // Drag & drop: panes accept the other's drops (local->remote = upload,
     // remote->local = download). Handled here rather than in the models so

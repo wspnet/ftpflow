@@ -18,6 +18,7 @@ qt_add_executable(ftpflow_app
     src/site_store.cpp
     src/command_dialog.cpp
     src/remote_command.cpp
+    src/remote_shell.cpp
     src/terminal_buffer.cpp
     src/vt_parser.cpp
     src/terminal_widget.cpp
