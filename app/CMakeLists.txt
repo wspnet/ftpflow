@@ -18,6 +18,9 @@ qt_add_executable(ftpflow_app
     src/site_store.cpp
     src/command_dialog.cpp
     src/remote_command.cpp
+    src/terminal_buffer.cpp
+    src/vt_parser.cpp
+    src/terminal_widget.cpp
 )
 target_link_libraries(ftpflow_app PRIVATE
     ftpflow_core
@@ -37,3 +40,10 @@ qt_add_executable(test_remote_model tests/test_remote_model.cpp src/remote_fs_mo
 target_include_directories(test_remote_model PRIVATE src)
 target_link_libraries(test_remote_model PRIVATE ftpflow_core Qt6::Core)
 target_compile_features(test_remote_model PRIVATE cxx_std_17)
+
+# Terminal buffer + VT parser unit test (no GUI, no Qt).
+add_executable(test_terminal tests/test_terminal.cpp src/terminal_buffer.cpp src/vt_parser.cpp)
+set_target_properties(test_terminal PROPERTIES AUTOMOC OFF)
+target_include_directories(test_terminal PRIVATE src)
+target_link_libraries(test_terminal PRIVATE ftpflow_core)
+target_compile_features(test_terminal PRIVATE cxx_std_17)
