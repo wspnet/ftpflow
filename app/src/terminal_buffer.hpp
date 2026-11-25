@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <vector>
 
 namespace ftpflow {
@@ -73,6 +74,17 @@ public:
     bool cursorVisible() const { return cursorVisible_; }
     void setCursorVisible(bool v) { cursorVisible_ = v; }
 
+    // Deferred wrap (xterm semantics): after printing in the last column the
+    // cursor stays there with wrapPending set; the next printable character
+    // wraps to column 0 of the next line. Any explicit cursor movement
+    // cancels the pending wrap.
+    bool wrapPending() const { return wrapPending_; }
+
+    // DECSC / DECRC (ESC 7 / ESC 8): save/restore cursor position, pending
+    // wrap and pen attributes.
+    void saveCursor();
+    void restoreCursor();
+
     // Current pen (applied to newly written cells).
     TermColor penFg() const { return penFg_; }
     TermColor penBg() const { return penBg_; }
@@ -91,10 +103,17 @@ public:
     // Write without advancing (for terminal `revision` cases).
     void setCharAt(std::uint32_t ch, int col, int row);
 
+    // True for East Asian Wide / Fullwidth code points (CJK, kana, fullwidth
+    // forms, common emoji). These occupy two terminal cells.
+    static bool isWideChar(std::uint32_t ch);
+
     void newline();              // move to next line, scroll if at bottom
     void carriageReturn();       // cursor to column 0
     void backspace();            // cursor left one, no erase
     void tab();                  // advance to next 8-col stop
+
+    void index();                // IND (ESC D): down one row, scroll at bottom
+    void reverseIndex();         // RI (ESC M): up one row, scroll down at top
 
     void clearAll();             // ED 2: clear screen, cursor home
     void clearToEnd();           // ED 0: clear cursor..end
@@ -115,10 +134,27 @@ public:
     void useAltScreen(bool use);
     bool altScreenActive() const { return altActive_; }
 
+    // --- scrollback history -----------------------------------------------
+    // Rows that scroll off the top of the main screen are saved here
+    // (oldest first), capped at kMaxHistoryLines. The alternate screen never
+    // writes history. Lines keep the column width they had when scrolled
+    // off; readers must tolerate shorter/longer lines after a resize.
+    using HistoryLine = std::vector<TermCell>;
+    const std::deque<HistoryLine>& history() const { return history_; }
+    void clearHistory() { history_.clear(); }
+    static constexpr std::size_t kMaxHistoryLines = 5000;
+
 private:
     int clampCol(int c) const { return c < 0 ? 0 : (c >= cols_ ? cols_ - 1 : c); }
     int clampRow(int r) const { return r < 0 ? 0 : (r >= rows_ ? rows_ - 1 : r); }
     void scrollRegion(int top, int bottom, int n);   // positive n scrolls up
+    void lineDown();             // one row down, scrolling at the region bottom
+    // Reset one cell, blanking the partner half of a wide pair it belongs to
+    // (a half glyph must never survive on its own).
+    void resetCellAt(int col, int row);
+    // Re-validate wide pairs on every row: a lead without its spacer, or a
+    // spacer without its lead, is blanked. Called after ops that shift cells.
+    void healWidePairs();
 
     int cols_ = 0;
     int rows_ = 0;
@@ -126,6 +162,7 @@ private:
 
     TermPos cursor_{0, 0};
     bool cursorVisible_ = true;
+    bool wrapPending_ = false;
     int scrollTop_ = 0;
     int scrollBottom_ = 0;
 
@@ -133,11 +170,23 @@ private:
     TermColor penBg_;
     std::uint8_t penFlags_ = TermCell::kNone;
 
+    // DECSC save slot (cursor + pending wrap + pen).
+    TermPos savedCursor_{0, 0};
+    bool savedWrapPending_ = false;
+    TermColor savedPenFg_;
+    TermColor savedPenBg_;
+    std::uint8_t savedPenFlags_ = TermCell::kNone;
+    bool savedValid_ = false;
+
     // Saved main screen + cursor when the alt screen is active.
     bool altActive_ = false;
     std::vector<TermCell> mainGrid_;
     TermPos mainCursor_{0, 0};
+    bool mainWrapPending_ = false;
     int mainScrollTop_ = 0, mainScrollBottom_ = 0;
+
+    // Scrolled-off rows of the main screen (oldest first).
+    std::deque<HistoryLine> history_;
 };
 
 }  // namespace ftpflow

@@ -21,6 +21,8 @@
 #include "ftpflow/protocol_status.hpp"
 #include "ftpflow/ssh_exec.hpp"
 #include "ftpflow/ssh_transfer.hpp"
+#include "ftpflow/shell_quote.hpp"
+#include "ftpflow/text_codec.hpp"
 #include "ftpflow/version.hpp"
 #include "ftpflow/vfs_local.hpp"
 #include "ftpflow/known_hosts.hpp"
@@ -80,16 +82,17 @@ ftpflow::FileProbe probeFile(const std::string& path, bool withSample) {
     probe.head.assign(head, head + n);
 
     if (withSample) {
-        // head/mid/tail 3x64 KiB sampling (stage 3 feed).
-        std::fseek(f, 0, SEEK_END);
-        long size = std::ftell(f);
+        // head/mid/tail 3x64 KiB sampling (stage 3 feed). 64-bit positions:
+        // 32-bit ftell wraps at 2 GB and mis-samples large files.
+        _fseeki64(f, 0, SEEK_END);
+        __int64 size = _ftelli64(f);
         probe.fileSize = size > 0 ? static_cast<std::uint64_t>(size) : 0;
-        constexpr long kWin = 64 * 1024;
-        long mid = size / 2;
-        long tail = size > kWin ? size - kWin : 0;
-        for (long off : {0L, mid, tail}) {
+        constexpr __int64 kWin = 64 * 1024;
+        __int64 mid = size / 2;
+        __int64 tail = size > kWin ? size - kWin : 0;
+        for (__int64 off : {(__int64)0, mid, tail}) {
             if (off < 0 || off >= size) continue;
-            std::fseek(f, off, SEEK_SET);
+            _fseeki64(f, off, SEEK_SET);
             std::vector<std::uint8_t> buf(kWin);
             std::size_t got = std::fread(buf.data(), 1, kWin, f);
             probe.sample.insert(probe.sample.end(), buf.data(), buf.data() + got);
@@ -166,18 +169,8 @@ int cmdInfo(const std::vector<std::string>& args) {
 //   compression fast path. A password of "-" plus --key <path> selects
 //   private-key auth (PEM/OpenSSH read from disk).
 static std::string readWholeFile(const std::string& path) {
-    std::string s;
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return s;
-    std::fseek(f, 0, SEEK_END);
-    long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (n > 0) {
-        s.resize(static_cast<std::size_t>(n));
-        std::fread(&s[0], 1, static_cast<std::size_t>(n), f);
-    }
-    std::fclose(f);
-    return s;
+    // Shared Unicode-safe reader (wide-path open on Windows).
+    return ftpflow::readWholeFileUtf8(path);
 }
 
 int cmdSshExec(const std::vector<std::string>& args) {
@@ -230,7 +223,13 @@ int cmdSshExec(const std::vector<std::string>& args) {
     std::vector<std::string> trusted;
     if (verify) {
         ftpflow::KnownHosts kh(g_knownHostsPath);
-        trusted = kh.trustedHexFor(ep.host, ep.port);
+        bool storeOk = true;
+        trusted = kh.trustedHexFor(ep.host, ep.port, &storeOk);
+        if (!storeOk) {
+            std::fprintf(stderr, "cannot read known_hosts store: %s\n",
+                         g_knownHostsPath.c_str());
+            return 1;
+        }
     }
 
     // Capture remote stdout/stderr, printing each stream as it arrives.
@@ -344,7 +343,9 @@ int cmdSshPush(const std::vector<std::string>& args) {
     }
 
     std::string command = cmdTemplate;
-    const std::string quoted = "\"" + remote + "\"";
+    // POSIX-safe quoting of the remote path (see shell_quote.hpp): the old
+    // raw double-quote wrap let $/backtick in a filename run commands.
+    const std::string quoted = ftpflow::shellQuote(remote);
     for (std::size_t pos; (pos = command.find("{file}")) != std::string::npos;)
         command.replace(pos, 6, quoted);
 
@@ -355,7 +356,13 @@ int cmdSshPush(const std::vector<std::string>& args) {
     std::vector<std::string> trusted;
     if (verify) {
         ftpflow::KnownHosts kh(g_knownHostsPath);
-        trusted = kh.trustedHexFor(ep.host, ep.port);
+        bool storeOk = true;
+        trusted = kh.trustedHexFor(ep.host, ep.port, &storeOk);
+        if (!storeOk) {
+            std::fprintf(stderr, "cannot read known_hosts store: %s\n",
+                         g_knownHostsPath.c_str());
+            return 1;
+        }
     }
     ftpflow::SshResult r = ssh.open(ep, command, trusted, &acceptedKey);
     if (verify && r.status == ftpflow::SshStatus::HostKeyRejected &&
@@ -512,7 +519,9 @@ int cmdFtp(const std::vector<std::string>& a) {
         std::string dir = i < a.size() ? a[i] : "/";
         ftpflow::ListingPage page = ftp.list(dir);
         if (page.entries.empty()) {
-            std::fprintf(stderr, "ftp ls: empty or failed (dir %s)\n", dir.c_str());
+            const std::string err = ftp.lastError();
+            std::fprintf(stderr, "ftp ls: empty or failed (dir %s)%s%s\n",
+                dir.c_str(), err.empty() ? "" : ": ", err.c_str());
             return 1;
         }
         std::printf("%-40s %12s %s\n", "NAME", "SIZE", "TYPE");
@@ -603,7 +612,13 @@ int cmdSftp(const std::vector<std::string>& a) {
     std::vector<std::string> trusted;
     if (verify) {
         ftpflow::KnownHosts kh(g_knownHostsPath);
-        trusted = kh.trustedHexFor(ep.host, ep.port);
+        bool storeOk = true;
+        trusted = kh.trustedHexFor(ep.host, ep.port, &storeOk);
+        if (!storeOk) {
+            std::fprintf(stderr, "cannot read known_hosts store: %s\n",
+                         g_knownHostsPath.c_str());
+            return 1;
+        }
     }
     ftpflow::SftpResult r = sftp.open(ep, trusted, &acceptedKey);
     if (verify && r.status == ftpflow::SftpStatus::HostKeyRejected &&
@@ -842,10 +857,12 @@ int cmdQueue(const std::vector<std::string>& a) {
     queue.setEventCallback([](const ftpflow::TransferEvent& e) {
         const char* kind = e.kind == ftpflow::TransferEvent::Kind::Started   ? "start"
                           : e.kind == ftpflow::TransferEvent::Kind::Progress ? "prog "
+                          : e.kind == ftpflow::TransferEvent::Kind::Queued   ? "queue"
                                                                              : "done ";
         const char* st = e.state == ftpflow::TransferState::Done    ? "done    "
                         : e.state == ftpflow::TransferState::Failed  ? "failed  "
                         : e.state == ftpflow::TransferState::Canceled ? "canceled"
+                        : e.state == ftpflow::TransferState::Skipped ? "skipped "
                                                                      : "running ";
         const char* mode = e.mode == ftpflow::TransferMode::Compress ? "compress"
                           : e.mode == ftpflow::TransferMode::Ftz1     ? "ftz1    "

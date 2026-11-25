@@ -47,9 +47,19 @@ void RemoteShell::stop() {
 void RemoteShell::runWorker(int cols, int rows) {
     const bool verify = !conn_.knownHostsPath.empty();
     std::vector<std::string> trusted;
+    bool storeOk = true;
     if (verify) {
         KnownHosts kh(conn_.knownHostsPath);
-        trusted = kh.trustedHexFor(conn_.ssh.host, conn_.ssh.port);
+        trusted = kh.trustedHexFor(conn_.ssh.host, conn_.ssh.port, &storeOk);
+    }
+    if (verify && !storeOk) {
+        // Fail closed: never open a shell when the pinning store is unreadable.
+        running_ = false;
+        QMetaObject::invokeMethod(
+            this,
+            [this] { emit finished("无法读取 known_hosts 主机密钥库"); },
+            Qt::QueuedConnection);
+        return;
     }
 
     SshExec exec(verify ? HostKeyPolicy::Strict : HostKeyPolicy::AcceptNew);

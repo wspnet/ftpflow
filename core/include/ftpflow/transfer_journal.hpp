@@ -12,6 +12,13 @@
 // it simple and write raw (paths are the only arbitrary text and 0x1F/0x0A
 // do not appear in Windows path names).
 //
+// The file is an APPEND LOG: `add()` appends one length-prefixed record
+// (O(1)); `remove()` appends a tombstone record (magic "JFTX" + jobId)
+// and periodically compacts the file back to the live set. `load()`
+// replays adds and removes in order. A record truncated at the tail (a
+// crash mid-append) is dropped silently; corrupt records in the middle
+// are an error.
+//
 // Credentials are NOT persisted: passwords and private keys are dropped
 // on save and left empty on load. The resume path re-supplies them (the
 // GUI pulls the password from the Windows Credential Manager via the site
@@ -60,12 +67,23 @@ public:
     bool load(std::vector<JournalRecord>& out, std::string* error) const;
 
     // Replaces the journal contents with `records` atomically (temp file
-    // + rename). Returns false + *error on IO failure.
+    // + rename). Returns false + *error on IO failure. Also used to
+    // compact the append log back to the live set.
     bool save(const std::vector<JournalRecord>& records,
               std::string* error) const;
 
-    // Removes one record by jobId (rewrites the file). Missing id is a
-    // no-op success.
+    // Appends one record to the journal (O(1); no rewrite).
+    bool add(const JournalRecord& rec, std::string* error) const;
+
+    // Appends many records in a single open-append-flush-close, so bulk
+    // enqueues (a drag of thousands of files) cost one disk round-trip
+    // instead of one per record.
+    bool addBatch(const std::vector<JournalRecord>& recs,
+                  std::string* error) const;
+
+    // Removes one record by jobId by appending a tombstone (O(1)); the
+    // log is compacted back to the live set after enough tombstones
+    // accumulate. Missing id is a no-op success.
     bool remove(std::uint64_t jobId, std::string* error) const;
 
     const std::string& path() const { return path_; }
@@ -81,6 +99,10 @@ public:
 
 private:
     std::string path_;
+    // Tombstones appended since the last compaction (remove() rewrites the
+    // log back to the live set once this crosses kCompactThreshold).
+    mutable std::uint32_t tombstonesSinceCompact_ = 0;
+    static constexpr std::uint32_t kCompactThreshold = 512;
 };
 
 }  // namespace ftpflow

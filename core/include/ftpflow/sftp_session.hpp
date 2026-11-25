@@ -94,6 +94,11 @@ public:
     // Remote file/directory stat: size (files) via *out.
     SftpResult size(const std::string& remotePath, std::uint64_t* out);
 
+    // Stat a remote path, filling `out` with size + mtime (and existence).
+    // NotFound means the path does not exist; other failures are mapped as
+    // usual. mtimeUnix is 0 when the server does not report it.
+    SftpResult stat(const std::string& remotePath, RemoteStat* out);
+
     // Downloads remote -> local in 64 KiB chunks. `resumeBytes` seeks the
     // remote handle and appends to the local file. `ctl` is polled between
     // chunks (pause parks, cancel aborts -> SftpStatus::Canceled). `moved`

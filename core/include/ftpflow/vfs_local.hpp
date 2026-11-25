@@ -24,6 +24,13 @@ public:
                      const std::string& startAfter = {},
                      std::uint32_t maxEntries = 0);
 
+    // Filesystem mutations. All paths are absolute UTF-8. Return an empty
+    // string on success, or a human-readable error on failure.
+    // `remove` deletes a file or an entire directory tree (recursive).
+    std::string remove(const std::string& path);
+    std::string rename(const std::string& from, const std::string& to);
+    std::string mkdir(const std::string& path);
+
 private:
     std::string root_;
 };

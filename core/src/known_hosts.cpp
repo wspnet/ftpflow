@@ -206,7 +206,18 @@ bool KnownHosts::load(std::vector<KnownHostEntry>& out,
     if (!enabled()) return true;
 
     std::ifstream f(path_, std::ios::binary);
-    if (!f) return true;   // missing file == empty store
+    if (!f) {
+        // "Missing" and "unreadable" imply different trust decisions. A
+        // missing store is a legitimate empty store; a store that EXISTS but
+        // cannot be read must fail loudly -- treating it as empty would
+        // silently downgrade strict pinning to trust-on-first-use.
+        const DWORD attrs = GetFileAttributesW(toWide(path_).c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            if (error) *error = "cannot read " + path_;
+            return false;
+        }
+        return true;   // missing file == empty store
+    }
 
     std::string line;
     while (std::getline(f, line)) {
@@ -214,11 +225,28 @@ bool KnownHosts::load(std::vector<KnownHostEntry>& out,
         if (line.empty() || line.front() == '#') continue;
 
         std::istringstream ss(line);
+        std::string t1, t2, t3;
+        if (!(ss >> t1 >> t2 >> t3)) continue;   // skip malformed
+
+        // Optional OpenSSH marker precedes the host field. `@revoked` keys
+        // must never be trusted again; `@cert-authority` lines and hashed
+        // hosts (|1|...) are unsupported and skipped (as before).
         std::string hostPort, keyType, b64;
-        if (!(ss >> hostPort >> keyType >> b64)) continue;   // skip malformed
+        bool revoked = false;
+        if (t1 == "@revoked") {
+            std::string t4;
+            if (!(ss >> t4)) continue;
+            revoked = true;
+            hostPort = t2; keyType = t3; b64 = t4;
+        } else if (t1 == "@cert-authority") {
+            continue;
+        } else {
+            hostPort = t1; keyType = t2; b64 = t3;
+        }
 
         KnownHostEntry e;
         e.keyType = keyType;
+        e.revoked = revoked;
         bool ok = false;
         e.blob = base64Decode(b64, &ok);
         if (!ok || e.blob.empty()) continue;   // skip bad base64
@@ -239,6 +267,7 @@ bool KnownHosts::save(const std::vector<KnownHostEntry>& entries,
 
     std::string body;
     for (const KnownHostEntry& e : entries) {
+        if (e.revoked) body += "@revoked ";
         body += formatHostPort(e.host, e.port);
         body += ' ';
         body += e.keyType.empty() ? "ssh-rsa" : e.keyType;
@@ -271,7 +300,8 @@ bool KnownHosts::contains(const std::string& host, std::uint16_t port,
     std::string err;
     if (!load(entries, &err)) return false;
     for (const KnownHostEntry& e : entries) {
-        if (e.host == host && e.port == port && e.blob == blob) return true;
+        if (!e.revoked && e.host == host && e.port == port && e.blob == blob)
+            return true;
     }
     return false;
 }
@@ -283,10 +313,21 @@ bool KnownHosts::trust(const std::string& host, std::uint16_t port,
     std::vector<KnownHostEntry> entries;
     if (!load(entries, error)) return false;
 
-    // Replace any existing entry for this host:port, else append.
+    // A @revoked blob must stay dead. Refusing here blocks every accept
+    // path (GUI dialog, CLI prompt, restore re-accept) in one place.
+    for (const KnownHostEntry& e : entries) {
+        if (e.revoked && e.host == host && e.port == port && e.blob == blob) {
+            if (error) *error = "host key is revoked (@revoked)";
+            return false;
+        }
+    }
+
+    // Replace any existing NON-revoked entry for this host:port, else
+    // append. Revoked entries are never replaced or dropped (replacing one
+    // would implicitly un-revoke the old key).
     bool replaced = false;
     for (KnownHostEntry& e : entries) {
-        if (e.host == host && e.port == port) {
+        if (!e.revoked && e.host == host && e.port == port) {
             e.keyType = keyType;
             e.blob = blob;
             replaced = true;
@@ -312,19 +353,38 @@ bool KnownHosts::forget(const std::string& host, std::uint16_t port,
     std::vector<KnownHostEntry> kept;
     kept.reserve(entries.size());
     for (KnownHostEntry& e : entries) {
-        if (!(e.host == host && e.port == port)) kept.push_back(std::move(e));
+        // Revoked entries survive so the key can never be re-accepted.
+        if (e.revoked || !(e.host == host && e.port == port))
+            kept.push_back(std::move(e));
     }
     return save(kept, error);
 }
 
+bool KnownHosts::isRevoked(const std::string& host, std::uint16_t port,
+                           const std::string& blob) const {
+    std::vector<KnownHostEntry> entries;
+    std::string err;
+    if (!load(entries, &err)) return false;
+    for (const KnownHostEntry& e : entries) {
+        if (e.revoked && e.host == host && e.port == port && e.blob == blob)
+            return true;
+    }
+    return false;
+}
+
 std::vector<std::string> KnownHosts::trustedHexFor(const std::string& host,
-                                                   std::uint16_t port) const {
+                                                   std::uint16_t port,
+                                                   bool* storeOk) const {
+    if (storeOk) *storeOk = true;
     std::vector<std::string> out;
     std::vector<KnownHostEntry> entries;
     std::string err;
-    if (!load(entries, &err)) return out;
+    if (!load(entries, &err)) {
+        if (storeOk) *storeOk = false;
+        return out;
+    }
     for (const KnownHostEntry& e : entries) {
-        if (e.host == host && e.port == port)
+        if (!e.revoked && e.host == host && e.port == port)
             out.push_back(hexOf(e.blob.data(), e.blob.size()));
     }
     return out;

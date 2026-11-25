@@ -12,16 +12,22 @@ RemoteCommand::RemoteCommand(const RemoteFsModel::ConnInfo& ci, QObject* parent)
     : QObject(parent), conn_(ci) {}
 
 RemoteCommand::~RemoteCommand() {
-    // The worker owns its own SshExec and only posts results via queued
-    // signals; joining here is optional (a still-running worker would just
-    // outlive us and its queued lambdas become no-ops once we're destroyed).
+    // Break the pump loop first: without this a long-running command
+    // (`tail -f`, `top`, ...) would keep the worker alive and this join
+    // would block the UI thread forever (e.g. closing the command dialog).
+    stop();
     if (worker_ && worker_->joinable()) worker_->join();
 }
 
 void RemoteCommand::start(const QString& command) {
     if (running_.exchange(true)) return;  // already running
+    stop_ = false;
     worker_ = std::make_unique<std::thread>(
         &RemoteCommand::runWorker, this, command.toStdString());
+}
+
+void RemoteCommand::stop() {
+    stop_ = true;
 }
 
 void RemoteCommand::runWorker(std::string command) {
@@ -29,9 +35,21 @@ void RemoteCommand::runWorker(std::string command) {
     // session used, mirroring RemoteFsModel's connect path.
     const bool verify = !conn_.knownHostsPath.empty();
     std::vector<std::string> trusted;
+    bool storeOk = true;
     if (verify) {
         KnownHosts kh(conn_.knownHostsPath);
-        trusted = kh.trustedHexFor(conn_.ssh.host, conn_.ssh.port);
+        trusted = kh.trustedHexFor(conn_.ssh.host, conn_.ssh.port, &storeOk);
+    }
+    if (verify && !storeOk) {
+        // Fail closed: never run commands when the pinning store is unreadable.
+        running_ = false;
+        QMetaObject::invokeMethod(
+            this,
+            [this] {
+                emit finished(-1, "无法读取 known_hosts 主机密钥库");
+            },
+            Qt::QueuedConnection);
+        return;
     }
 
     SshExec exec(verify ? HostKeyPolicy::Strict : HostKeyPolicy::AcceptNew);
@@ -80,9 +98,11 @@ void RemoteCommand::runWorker(std::string command) {
     // (commands that read stdin, e.g. `cat`, would otherwise block forever).
     exec.sendEof();
 
-    // Drain stdout/stderr until the channel closes.
-    while (exec.pump(500)) {
+    // Drain stdout/stderr until the channel closes -- or until stop() is
+    // requested (pump() polls in 500 ms slices, so cancellation is prompt).
+    while (!stop_.load() && exec.pump(500)) {
     }
+    const bool aborted = stop_.load();
 
     const int code = exec.exitCode();
     exec.close();
@@ -90,7 +110,11 @@ void RemoteCommand::runWorker(std::string command) {
 
     QMetaObject::invokeMethod(
         this,
-        [this, code] { emit finished(code, QString()); },
+        [this, code, aborted] {
+            emit finished(aborted ? -1 : code,
+                          aborted ? QStringLiteral("命令已中止")
+                                  : QString());
+        },
         Qt::QueuedConnection);
 }
 

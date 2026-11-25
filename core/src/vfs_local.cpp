@@ -130,4 +130,91 @@ ListingPage LocalFsBackend::list(const std::string& dir,
     return page;
 }
 
+namespace {
+
+// Recursively deletes a directory tree using the Win32 wide API (no shell
+// dependency, so it never pops a confirmation dialog). Returns an empty
+// string on success or a UTF-8 error message.
+std::string removeTree(const std::wstring& dir) {
+    const std::wstring pattern = dir + L"\\*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        // An empty/nonexistent directory: still try to remove it.
+        if (RemoveDirectoryW(dir.c_str())) return {};
+        DWORD e = GetLastError();
+        return "remove dir failed (" + std::to_string(e) + ")";
+    }
+    do {
+        const std::wstring name(fd.cFileName);
+        if (name == L"." || name == L"..") continue;
+        const std::wstring full = dir + L"\\" + name;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                // Directory junction / symlink: remove the LINK itself.
+                // Recursing into it would delete the target's real data.
+                SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (!RemoveDirectoryW(full.c_str())) {
+                    DWORD e = GetLastError();
+                    FindClose(h);
+                    return "remove junction failed (" + std::to_string(e) + ")";
+                }
+                continue;
+            }
+            std::string subErr = removeTree(full);
+            if (!subErr.empty()) {
+                FindClose(h);
+                return subErr;
+            }
+        } else {
+            // File (incl. file symlink/reparse point): DeleteFile removes
+            // the link, never the link target.
+            SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+            if (!DeleteFileW(full.c_str())) {
+                DWORD e = GetLastError();
+                FindClose(h);
+                return "delete file failed (" + std::to_string(e) + ")";
+            }
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    if (RemoveDirectoryW(dir.c_str())) return {};
+    DWORD e = GetLastError();
+    return "remove dir failed (" + std::to_string(e) + ")";
+}
+
+}  // namespace
+
+std::string LocalFsBackend::remove(const std::string& path) {
+    const std::wstring w = utf8ToWide(path);
+    DWORD attrs = GetFileAttributesW(w.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return "路径不存在";
+    }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        return removeTree(w);
+    }
+    SetFileAttributesW(w.c_str(), FILE_ATTRIBUTE_NORMAL);
+    if (DeleteFileW(w.c_str())) return {};
+    DWORD e = GetLastError();
+    return "删除文件失败 (" + std::to_string(e) + ")";
+}
+
+std::string LocalFsBackend::rename(const std::string& from,
+                                   const std::string& to) {
+    if (MoveFileW(utf8ToWide(from).c_str(), utf8ToWide(to).c_str())) {
+        return {};
+    }
+    DWORD e = GetLastError();
+    return "重命名失败 (" + std::to_string(e) + ")";
+}
+
+std::string LocalFsBackend::mkdir(const std::string& path) {
+    if (CreateDirectoryW(utf8ToWide(path).c_str(), nullptr)) return {};
+    DWORD e = GetLastError();
+    if (e == ERROR_ALREADY_EXISTS) return {};
+    return "新建文件夹失败 (" + std::to_string(e) + ")";
+}
+
 }  // namespace ftpflow

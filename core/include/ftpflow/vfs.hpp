@@ -51,4 +51,14 @@ struct ListingPage {
     bool hasMore = false;
 };
 
+// Result of stat-ing a single remote file: size plus last-modified time.
+// Used for same-name conflict detection (Smart policy compares both). A
+// backend that cannot report mtime leaves mtimeUnix == 0 ("unknown").
+struct RemoteStat {
+    bool exists = false;
+    bool isDir = false;
+    std::uint64_t size = 0;
+    std::int64_t mtimeUnix = 0;   // seconds since epoch; 0 = unknown
+};
+
 }  // namespace ftpflow

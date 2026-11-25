@@ -340,17 +340,30 @@ bool SshExec::pump(int timeoutMs) {
                 if (stream == 0 && impl_->onStdout) impl_->onStdout(buf, (std::size_t)n);
                 if (stream == 1 && impl_->onStderr) impl_->onStderr(buf, (std::size_t)n);
                 gotData = true;
+                continue;
             }
+            if (n < 0) {
+                // A real read error (socket died, channel closed, ...).
+                // Swallowing it here used to spin the caller's pump loop
+                // forever (waitSocket on a dead socket returns at once).
+                // Stop pumping and tear the channel down instead.
+                close();
+                return false;
+            }
+            // n == 0: EOF on this stream; keep polling the other one.
         }
     }
 
     if (libssh2_channel_eof(impl_->channel)) {
         // The exit status arrives in a channel-close message that must be
         // consumed on a non-blocking session. Loop wait_closed until it
-        // stops returning EAGAIN, then read the status.
+        // stops returning EAGAIN, then read the status. Bounded so a peer
+        // that never sends the close cannot stall us forever.
         int wc;
+        int closeWaits = 0;
         while ((wc = libssh2_channel_wait_closed(impl_->channel))
-               == LIBSSH2_ERROR_EAGAIN) {
+               == LIBSSH2_ERROR_EAGAIN && closeWaits < 150) {
+            ++closeWaits;
             waitSocket(impl_->sock, false, 200);
         }
         exitCode_ = libssh2_channel_get_exit_status(impl_->channel);

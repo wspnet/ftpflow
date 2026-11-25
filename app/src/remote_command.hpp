@@ -39,6 +39,13 @@ public:
     // Launch the command on a worker thread. Safe to call once.
     void start(const QString& command);
 
+    // Politely ask the running command to stop: the worker breaks out of
+    // its pump loop at the next 500 ms poll and finishes with a
+    // "命令已中止" message. Safe to call from any thread; a no-op once the
+    // worker has already exited. Destructor calls this before joining so
+    // destroying the dialog can never block on a long-running command.
+    void stop();
+
     bool isRunning() const { return running_; }
 
 signals:
@@ -54,6 +61,7 @@ private:
 
     RemoteFsModel::ConnInfo conn_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> stop_{false};
     std::unique_ptr<std::thread> worker_;
 };
 

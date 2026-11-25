@@ -17,6 +17,8 @@ namespace {
 
 constexpr std::uint32_t kMagic = 0x4654464A;   // "JFTF" little-endian
 constexpr std::uint32_t kVersion = 1;
+// Tombstone record (append-log removal): "JFTX" + u32 jobId lo + u32 hi.
+constexpr std::uint32_t kRemoveMagic = 0x5846544A;   // "JFTX" little-endian
 
 // ---- binary field helpers -------------------------------------------------
 
@@ -214,6 +216,50 @@ std::string TransferJournal::defaultPath() {
     return appDataDir() + "\\ftpflow\\transfers.dat";
 }
 
+namespace {
+
+// Creates the journal's parent directory when missing.
+void ensureParentDir(const std::string& path) {
+    const std::size_t slash = path.find_last_of("\\/");
+    if (slash != std::string::npos) {
+        CreateDirectoryW(toWide(path.substr(0, slash)).c_str(), nullptr);
+    }
+}
+
+// Appends one length-prefixed body to the journal (open-append-close).
+bool appendRaw(const std::string& path, const std::string& enc,
+               std::string* error) {
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    if (!f) {
+        if (error) *error = "cannot open " + path;
+        return false;
+    }
+    char lenBuf[4] = {
+        (char)(enc.size() & 0xFF),
+        (char)((enc.size() >> 8) & 0xFF),
+        (char)((enc.size() >> 16) & 0xFF),
+        (char)((enc.size() >> 24) & 0xFF),
+    };
+    f.write(lenBuf, 4);
+    f.write(enc.data(), (std::streamsize)enc.size());
+    f.flush();
+    if (!f) {
+        if (error) *error = "append failed for " + path;
+        return false;
+    }
+    return true;
+}
+
+std::string encodeTombstone(std::uint64_t jobId) {
+    std::string out;
+    writeU32(out, kRemoveMagic);
+    writeU32(out, (std::uint32_t)(jobId & 0xFFFFFFFF));
+    writeU32(out, (std::uint32_t)(jobId >> 32));
+    return out;
+}
+
+}  // namespace
+
 bool TransferJournal::load(std::vector<JournalRecord>& out,
                            std::string* error) const {
     out.clear();
@@ -227,22 +273,40 @@ bool TransferJournal::load(std::vector<JournalRecord>& out,
 
     // Length-prefixed records: u32 LE record length + record body. Reading
     // by length (not by '\n') keeps binary field bytes from being mistaken
-    // for a delimiter.
+    // for a delimiter. The file is an append log: "JFTF" bodies add a
+    // record, "JFTX" bodies (tombstones) drop one. A body truncated at the
+    // tail (crash mid-append) is dropped silently -- earlier records are
+    // still valid -- while corruption in the middle is an error.
     for (;;) {
         unsigned char lenBuf[4];
         f.read((char*)lenBuf, 4);
         if (f.gcount() == 0) break;             // clean EOF
-        if (f.gcount() != 4) {                   // truncated header
-            if (error) *error = "truncated journal header in " + path_;
-            return false;
-        }
+        if (f.gcount() != 4) break;             // truncated tail header: salvage
         const std::uint32_t len = lenBuf[0] | (lenBuf[1] << 8) |
                                   (lenBuf[2] << 16) |
                                   ((std::uint32_t)lenBuf[3] << 24);
         std::string body(len, '\0');
         f.read(&body[0], len);
-        if (f.gcount() != (std::streamsize)len) {
-            if (error) *error = "truncated journal record in " + path_;
+        if (f.gcount() != (std::streamsize)len) break;   // truncated tail body
+
+        Reader r{body};
+        const std::uint32_t head = r.u32();
+        if (head == kRemoveMagic) {
+            // Tombstone: drop the record with this jobId (if present).
+            const std::uint64_t lo = r.u32();
+            const std::uint64_t hi = r.u32();
+            if (!r.ok) {
+                if (error) *error = "corrupt journal tombstone in " + path_;
+                return false;
+            }
+            const std::uint64_t id = lo | (hi << 32);
+            for (auto it = out.begin(); it != out.end(); ++it) {
+                if (it->jobId == id) { out.erase(it); break; }
+            }
+            continue;
+        }
+        if (head != kMagic) {
+            if (error) *error = "corrupt journal record in " + path_;
             return false;
         }
         JournalRecord rec;
@@ -302,16 +366,61 @@ bool TransferJournal::save(const std::vector<JournalRecord>& records,
     return true;
 }
 
+bool TransferJournal::add(const JournalRecord& rec, std::string* error) const {
+    if (!enabled()) return true;
+    ensureParentDir(path_);
+    return appendRaw(path_, encodeRecord(rec), error);
+}
+
+bool TransferJournal::addBatch(const std::vector<JournalRecord>& recs,
+                               std::string* error) const {
+    if (!enabled()) return true;
+    if (recs.empty()) return true;
+    ensureParentDir(path_);
+
+    // Encode every record first, then write them all through a single
+    // open-append-flush-close. Bulk enqueues (a drag of thousands of files)
+    // then cost one disk round-trip instead of one per record.
+    std::ofstream f(path_, std::ios::binary | std::ios::app);
+    if (!f) {
+        if (error) *error = "cannot open " + path_;
+        return false;
+    }
+    for (const JournalRecord& rec : recs) {
+        const std::string enc = encodeRecord(rec);
+        char lenBuf[4] = {
+            (char)(enc.size() & 0xFF),
+            (char)((enc.size() >> 8) & 0xFF),
+            (char)((enc.size() >> 16) & 0xFF),
+            (char)((enc.size() >> 24) & 0xFF),
+        };
+        f.write(lenBuf, 4);
+        f.write(enc.data(), (std::streamsize)enc.size());
+        if (!f) {
+            if (error) *error = "append failed for " + path_;
+            return false;
+        }
+    }
+    f.flush();
+    if (!f) {
+        if (error) *error = "append failed for " + path_;
+        return false;
+    }
+    return true;
+}
+
 bool TransferJournal::remove(std::uint64_t jobId, std::string* error) const {
     if (!enabled()) return true;
-    std::vector<JournalRecord> recs;
-    if (!load(recs, error)) return false;
-    std::vector<JournalRecord> kept;
-    kept.reserve(recs.size());
-    for (auto& r : recs) {
-        if (r.jobId != jobId) kept.push_back(std::move(r));
-    }
-    return save(kept, error);
+    // O(1) tombstone append; load() replays adds and removes in order.
+    ensureParentDir(path_);
+    if (!appendRaw(path_, encodeTombstone(jobId), error)) return false;
+    if (++tombstonesSinceCompact_ < kCompactThreshold) return true;
+
+    // Enough tombstones accumulated: compact the log back to the live set.
+    tombstonesSinceCompact_ = 0;
+    std::vector<JournalRecord> live;
+    if (!load(live, error)) return false;
+    return save(live, error);
 }
 
 }  // namespace ftpflow

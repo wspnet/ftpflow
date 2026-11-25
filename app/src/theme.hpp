@@ -18,11 +18,11 @@ inline const char* kAccent = "#2ea8c0";   // teal accent (XTerminal-like)
 inline const char* kBg = "#1e1e1e";       // window background
 inline const char* kPanel = "#252526";    // panels / docks / headers
 inline const char* kField = "#2d2d30";    // inputs / table background
-inline const char* kBorder = "#3c3c41";   // subtle borders
+inline const char* kBorder = "#38383d";   // subtle borders
 inline const char* kText = "#d4d4d4";     // primary text
 inline const char* kMuted = "#9d9d9d";    // secondary text
 inline const char* kSelection = "#264f78"; // selection highlight
-inline const char* kHover = "#2a2d2e";    // hover background
+inline const char* kHover = "#2f3134";    // hover background
 inline const char* kDanger = "#f48771";   // error / destructive
 
 // Build the application palette.
@@ -67,25 +67,79 @@ QWidget {
 }
 QLabel#paneTitle {
     background-color: %4;
-    color: %9;
+    color: %2;
     font-weight: 700;
-    padding: 6px 8px;
-    border-bottom: 1px solid %5;
+    padding: 8px 12px;
+    border-radius: 6px;
 }
 QMainWindow, QDialog {
     background-color: %1;
 }
+QWidget#titleBar {
+    background-color: %4;
+}
+QLabel#titleBarText {
+    background: transparent;
+    color: %9;
+    font-weight: 600;
+    padding-left: 6px;
+}
+QToolButton#titleBarBtn {
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    margin: 2px;
+}
+QToolButton#titleBarBtn:hover {
+    background-color: %7;
+    border-radius: 4px;
+}
+QToolButton#titleBarCloseBtn:hover {
+    background-color: #c42b1c;
+}
+QToolButton#accountBtn {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: %8;
+    padding: 2px 10px;
+}
+QToolButton#accountBtn:hover {
+    background-color: %7;
+    color: %2;
+}
+QToolButton#accountBtn::menu-indicator {
+    image: none;
+}
+
+/* ---- Account menu (simple header + plain items) ---- */
+QWidget#accountMenuHeader {
+    background: transparent;
+}
+QLabel#accountMenuName {
+    background: transparent;
+    color: %2;
+    font-size: 11pt;
+    font-weight: 700;
+}
+QLabel#accountMenuBadge {
+    background: transparent;
+    color: %8;
+    font-size: 8.5pt;
+}
+
 QTableView, QTreeView, QListView, QListWidget {
     background-color: %3;
     alternate-background-color: %4;
     border: 1px solid %5;
+    border-radius: 6px;
     gridline-color: %5;
     selection-background-color: %6;
     selection-color: #ffffff;
     outline: none;
 }
 QTableView::item, QTreeView::item, QListWidget::item {
-    padding: 2px 4px;
+    padding: 3px 6px;
 }
 QTableView::item:hover, QTreeView::item:hover, QListWidget::item:hover {
     background-color: %7;
@@ -96,18 +150,24 @@ QHeaderView::section {
     border: none;
     border-right: 1px solid %5;
     border-bottom: 1px solid %5;
-    padding: 4px 6px;
+    padding: 5px 8px;
     font-weight: 600;
 }
 QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit {
     background-color: %3;
     border: 1px solid %5;
-    border-radius: 3px;
-    padding: 4px 6px;
+    border-radius: 6px;
+    padding: 5px 8px;
     selection-background-color: %6;
 }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
     border: 1px solid %9;
+}
+/* Inline rename editor lives inside a ~20px table row; the generic 5px
+   vertical padding above would squeeze the text out of view. */
+QLineEdit[ftpflowInlineEdit="true"] {
+    padding: 0px 4px;
+    border-radius: 3px;
 }
 QLineEdit[readOnly="true"] {
     background-color: %1;
@@ -125,8 +185,8 @@ QComboBox QAbstractItemView {
 QPushButton {
     background-color: %4;
     border: 1px solid %5;
-    border-radius: 3px;
-    padding: 4px 12px;
+    border-radius: 6px;
+    padding: 5px 14px;
 }
 QPushButton:hover {
     background-color: %7;
@@ -145,6 +205,7 @@ QPushButton[accent="true"] {
     color: #0b0c0d;
     font-weight: 600;
     border: none;
+    border-radius: 6px;
 }
 QPushButton[accent="true"]:hover {
     background-color: #4fc1d9;
@@ -154,6 +215,7 @@ QPushButton[danger="true"] {
     color: #1a1a1a;
     font-weight: 600;
     border: none;
+    border-radius: 6px;
 }
 QMenuBar {
     background-color: %4;
@@ -165,9 +227,12 @@ QMenuBar::item:selected {
 QMenu {
     background-color: %4;
     border: 1px solid %5;
+    border-radius: 6px;
+    padding: 4px;
 }
 QMenu::item {
     padding: 5px 24px 5px 20px;
+    border-radius: 4px;
 }
 QMenu::item:selected {
     background-color: %6;
@@ -176,6 +241,59 @@ QMenu::separator {
     height: 1px;
     background-color: %5;
     margin: 4px 8px;
+}
+QTabWidget::pane {
+    background-color: %3;
+    border-left: 1px solid %5;
+    border-right: 1px solid %5;
+    border-bottom: 1px solid %5;
+    border-top: none;
+    border-bottom-left-radius: 6px;
+    border-bottom-right-radius: 6px;
+}
+QTabBar {
+    background: transparent;
+    border: none;
+}
+QTabBar::tab {
+    background: transparent;
+    color: %8;
+    border: none;
+    border-radius: 8px;
+    padding: 6px 12px;
+    margin-right: 4px;
+}
+QTabBar::tab:hover:!selected {
+    background-color: %7;
+}
+QTabBar::tab:selected {
+    background-color: #3a3d41;
+    color: #ffffff;
+    font-weight: 600;
+}
+QTabBar::tab:last {
+    /* The "+" new-session tab: a compact rounded square button with a small
+       gap before it, matching the modern browser new-tab button. */
+    padding: 6px 7px;
+    margin-left: 4px;
+    background: transparent;
+    color: %2;
+}
+QTabBar::tab:last:hover {
+    background-color: %7;
+}
+QToolButton#tabCloseBtn {
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 2px;
+    margin: 0px;
+}
+QToolButton#tabCloseBtn:hover {
+    background-color: %7;
+}
+QToolButton#tabCloseBtn:pressed {
+    background-color: %6;
 }
 QDockWidget {
     titlebar-close-icon: none;
@@ -186,6 +304,19 @@ QDockWidget::title {
     padding: 6px;
     border-bottom: 1px solid %5;
     font-weight: 600;
+}
+QWidget#dockTitleBar {
+    background-color: %4;
+    border-bottom: 1px solid %5;
+}
+QToolButton#dockCloseBtn {
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    margin: 2px;
+}
+QToolButton#dockCloseBtn:hover {
+    background-color: #c42b1c;
 }
 QStatusBar {
     background-color: %4;
@@ -199,6 +330,7 @@ QToolTip {
     background-color: %4;
     color: %2;
     border: 1px solid %5;
+    border-radius: 4px;
     padding: 4px;
 }
 QSplitter::handle {
@@ -239,16 +371,30 @@ QScrollBar::add-line, QScrollBar::sub-line {
 QProgressBar {
     background-color: %3;
     border: 1px solid %5;
-    border-radius: 3px;
+    border-radius: 6px;
     text-align: center;
     color: %2;
 }
 QProgressBar::chunk {
     background-color: %9;
-    border-radius: 2px;
+    border-radius: 5px;
+}
+QCheckBox, QRadioButton {
+    color: %2;
+    spacing: 6px;
 }
 QCheckBox::indicator, QRadioButton::indicator {
-    width: 14px; height: 14px;
+    width: 16px; height: 16px;
+    background-color: %3;
+    border: 1px solid %8;
+    border-radius: 3px;
+}
+QCheckBox::indicator:hover, QRadioButton::indicator:hover {
+    border: 1px solid %9;
+}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background-color: %9;
+    border: 1px solid %9;
 }
 )QSS")
         .arg(kBg, kText, kField, kPanel, kBorder, kSelection, kHover,

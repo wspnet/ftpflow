@@ -5,6 +5,7 @@
 
 #include <QtCore/QAbstractTableModel>
 #include <QtCore/QFutureWatcher>
+#include <QtCore/QModelIndexList>
 
 #include <map>
 #include <string>
@@ -54,10 +55,33 @@ public:
     QString pathAt(const QModelIndex& idx) const;
     std::string relativeAt(const QModelIndex& idx) const;
     bool isDir(const QModelIndex& idx) const;
+    // True when `idx` is the synthetic ".." parent row (top of a non-root
+    // listing). Such rows cannot be renamed/deleted/dragged.
+    bool isParentRow(const QModelIndex& idx) const;
+
+    // Filesystem mutations. Each operates on absolute paths and reloads the
+    // current directory on success. `name` is relative to the current dir.
+    // The entry-taking variants return how many entries were actually
+    // deleted / moved so the UI can report a result.
+    void makeDir(const std::string& name);
+    int removeEntries(const QModelIndexList& rows);   // recursive for dirs
+    void renameEntry(const QModelIndex& idx, const std::string& newName);
+
+    // Move the given absolute source paths into `destDir` (absolute), keeping
+    // each entry's base name. Cross-directory rename on the same volume.
+    // Returns the number of entries moved.
+    int moveEntries(const QStringList& sourcePaths, const QString& destDir);
+
+    // Reload the current directory (drop the cache and re-list).
+    void refresh();
 
     int rowCount(const QModelIndex& parent = {}) const override;
     int columnCount(const QModelIndex& parent = {}) const override;
     QVariant data(const QModelIndex& idx, int role) const override;
+    // Inline rename: the item delegate writes the edited name through
+    // Qt::EditRole on the name column.
+    bool setData(const QModelIndex& idx, const QVariant& value,
+                 int role = Qt::EditRole) override;
     QVariant headerData(int section, Qt::Orientation o,
                         int role = Qt::DisplayRole) const override;
     bool canFetchMore(const QModelIndex& parent) const override;
@@ -70,6 +94,9 @@ public:
 
 signals:
     void verdictsReady();
+    // A filesystem mutation (delete / rename / move / mkdir) failed.
+    // Carries a human-readable summary for the status bar / message log.
+    void operationError(const QString& message);
 
 private:
     void loadFirstPage();
@@ -79,6 +106,11 @@ private:
     void onDirChangedExternal(const std::string& dir);
     Entry entryAt(int row) const { return entries_[static_cast<std::size_t>(row)]; }
     std::string currentFullPath() const;
+    std::string parentRelative() const;   // relative path of the parent dir
+    // Absolute path of the parent of the current directory; empty when the
+    // current directory is already a drive root (e.g. "C:\"). Used both to
+    // decide whether to show the ".." row and as the goUp() target.
+    std::string parentFullPath() const;
 
     LocalFsBackend backend_;
     DirCache cache_;                     // full-listing snapshots per dir

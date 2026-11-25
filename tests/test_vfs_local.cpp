@@ -65,6 +65,26 @@ int main() {
     CHECK2(p2.entries.size() == 1);
     CHECK2(!p2.hasMore);
 
+    // --- mutations: mkdir / rename / remove (with a Chinese path) ----------
+    const std::string cdir = tmp.u8string() + "/中文目录";
+    CHECK2(backend.mkdir(cdir).empty());          // create a Chinese-named dir
+    const std::string oldPath = tmp.u8string() + "/a.txt";
+    const std::string newPath = tmp.u8string() + "/中文文件.txt";
+    CHECK2(backend.rename(oldPath, newPath).empty());  // rename to Chinese
+    ListingPage afterRename = backend.list({});
+    bool sawChinese = false, sawOldGone = true;
+    for (const auto& e : afterRename.entries) {
+        if (e.name == "中文文件.txt") sawChinese = true;
+        if (e.name == "a.txt") sawOldGone = false;
+    }
+    CHECK2(sawChinese && sawOldGone);
+    // remove the Chinese-named file
+    CHECK2(backend.remove(newPath).empty());
+    // remove the whole Chinese-named directory
+    CHECK2(backend.remove(cdir).empty());
+    // remove a nonexistent path must return a non-empty error (not crash)
+    CHECK2(!backend.remove(tmp.u8string() + "/ghost").empty());
+
     fs::remove_all(tmp, ec);
     std::printf("vfs_local: %d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;

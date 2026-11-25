@@ -75,6 +75,10 @@ struct FtpOptions {
     bool tls = false;               // AUTH TLS (explicit FTPS)
     bool implicitTls = false;       // ftps:// implicit TLS on 990
     int connectTimeoutMs = 10000;
+    // Filename byte encoding the server uses. "auto" (default) keeps valid
+    // UTF-8 and treats everything else as GBK; "utf-8" forces UTF-8; "gbk"
+    // forces the Chinese ANSI code page (covers IIS on a Chinese box).
+    std::string encoding = "auto";
 };
 
 class FtpSession {
@@ -93,8 +97,21 @@ public:
     // Lists one remote directory (whole listing; FTP has no cursor).
     ListingPage list(const std::string& dir);
 
+    // Lists one remote directory forcing `LIST -a` (show hidden entries).
+    // Some servers (IIS / hosting panels) hide dot-files and system files
+    // from the default LIST/MLSD, which makes a directory look empty while
+    // RMD still answers 550 ("not empty"). Used by recursive deletion to
+    // surface and remove those hidden stragglers before RMD.
+    ListingPage listAll(const std::string& dir);
+
     // Remote file size via SIZE (binary mode); 0 + non-Ok on failure.
     FtpResult size(const std::string& remotePath, std::uint64_t* out);
+
+    // Stat a remote file: fills `out` (exists + size). FTP cannot cheaply
+    // report mtime through libcurl (MDTM needs control-response parsing), so
+    // mtimeUnix stays 0 ("unknown"); Smart conflict detection falls back to
+    // size-only comparison on FTP.
+    FtpResult stat(const std::string& remotePath, RemoteStat* out);
 
     // Downloads remote -> local. `resumeBytes` continues an interrupted
     // transfer (FTP REST) by appending to the local file from that offset.
@@ -129,6 +146,12 @@ public:
     bool isOpen() const { return opened_; }
     void close();
 
+    // The encoding actually in effect after a list(): in "auto" mode a GBK
+    // listing locks this to "gbk" so that downstream reverse conversions
+    // (CWD, MKD/DELE/RMD, rename, and -- critically -- the transfer queue's
+    // separate FtpSession) send GBK bytes instead of round-tripping UTF-8.
+    std::string effectiveEncoding() const { return opt_.encoding; }
+
     // True when the most recent failed operation was a transport drop
     // (CURLE_RECV_ERROR / CURLE_SEND_ERROR) rather than a server-side or
     // business error. Mirrors SftpSession::connectionLost() for the GUI's
@@ -142,10 +165,23 @@ public:
 
 private:
     struct Impl;
-    FtpResult quoteCommand(const std::string& cmd);
+    // Issues `cmd` verbatim via CURLOPT_QUOTE, prefixed with an explicit
+    // `CWD <cwdDir>`. libcurl sends QUOTE commands BEFORE its own CWD (see
+    // the CURLOPT_QUOTE docs), so without this prefix a relative command
+    // would run in whatever directory the connection was last left in.
+    // CWD-ing ourselves first lets a relative basename work on strict
+    // servers (IIS / Windows hosting panels) that reject absolute paths in
+    // DELE/RMD/MKD/RNFR -- exactly what FileZilla does.
+    FtpResult quoteCommand(const std::string& cwdDir, const std::string& cmd);
     // MLSD (RFC 3659) listing attempt; returns false and leaves lastErr set
     // when the server rejects MLSD so the caller falls back to LIST.
     bool listViaMlsd(const std::string& dir, std::vector<Entry>& out);
+    // Converts an internal remote path (e.g. "/wwwroot/images") into the
+    // physical absolute path the server expects on the control channel. On
+    // IIS user isolation this prefixes the login root (homeDir, e.g.
+    // "/zmailvip163com8"); on a normal server it returns the path unchanged
+    // (which is already physical-absolute). Always starts with '/'.
+    std::string toServerAbsPath(const std::string& path) const;
     Impl* impl_ = nullptr;
     bool opened_ = false;
     FtpOptions opt_;

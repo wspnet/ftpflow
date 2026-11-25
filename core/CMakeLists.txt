@@ -27,7 +27,9 @@ target_sources(ftpflow_core PRIVATE
     src/known_hosts.cpp
     src/tree_walk.cpp
     src/ftp_session.cpp
+    src/text_codec.cpp
     src/ftz1.cpp
+    src/dir_archive.cpp
     src/dir_cache.cpp
     src/fs_watcher.cpp
     src/backend_stubs.cpp

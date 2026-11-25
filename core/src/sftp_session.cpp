@@ -11,6 +11,8 @@
 #include <cstring>
 #include <thread>
 
+#include "ftpflow/text_codec.hpp"
+
 #if defined(FTPFLOW_HAVE_LIBSSH2)
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -338,6 +340,36 @@ SftpResult SftpSession::size(const std::string& remotePath, std::uint64_t* out) 
     return {};
 }
 
+SftpResult SftpSession::stat(const std::string& remotePath, RemoteStat* out) {
+    if (out) *out = RemoteStat{};
+    if (state_ != State::Open || !impl_->sftp) {
+        return {SftpStatus::IoError, "session not open"};
+    }
+    LIBSSH2_SFTP_ATTRIBUTES attrs{};
+    int rc = 0;
+    while ((rc = libssh2_sftp_stat(impl_->sftp, remotePath.c_str(), &attrs))
+           == LIBSSH2_ERROR_EAGAIN) {
+        waitSocket(impl_->sock, false, 5000);
+    }
+    if (rc != 0) {
+        const SftpStatus st = classifySftpErr(impl_->sftp);
+        // A missing file is a normal "does not exist" answer, not an error,
+        // for conflict detection. Surface it as NotFound and leave `out`
+        // with exists == false so callers can branch cleanly.
+        return mapSshErr(st, ("stat " + remotePath).c_str(), impl_->session);
+    }
+    if (out) {
+        out->exists = true;
+        if (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) {
+            out->isDir = LIBSSH2_SFTP_S_ISDIR(attrs.permissions) != 0;
+        }
+        if (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE) out->size = attrs.filesize;
+        if (attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME)
+            out->mtimeUnix = (std::int64_t)attrs.mtime;
+    }
+    return {};
+}
+
 SftpResult SftpSession::download(const std::string& remotePath,
                                  const std::string& localPath,
                                  std::uint64_t resumeBytes,
@@ -369,7 +401,7 @@ SftpResult SftpSession::download(const std::string& remotePath,
     }
 
     const char* mode = resumeBytes > 0 ? "ab" : "wb";
-    std::FILE* f = std::fopen(localPath.c_str(), mode);
+    std::FILE* f = openLocalFile(localPath, mode);
     if (!f) {
         libssh2_sftp_close(h);
         return {SftpStatus::IoError, "cannot open local " + localPath};
@@ -408,6 +440,7 @@ SftpResult SftpSession::download(const std::string& remotePath,
         }
         moved += (std::uint64_t)n;
         if (bytesMoved) *bytesMoved = moved;
+        throttle(ctl, (std::uint64_t)n);   // respect the global rate limit
         if (impl_->onProgress) impl_->onProgress(moved, impl_->progressTotal);
     }
 
@@ -428,14 +461,12 @@ SftpResult SftpSession::upload(const std::string& localPath,
         return {SftpStatus::IoError, "session not open"};
     }
 
-    std::FILE* f = std::fopen(localPath.c_str(), "rb");
+    std::FILE* f = openLocalFile(localPath, "rb");
     if (!f) return {SftpStatus::IoError, "cannot open local " + localPath};
     impl_->progressTotal = resumeBytes;
     {
-        struct _stat64 st{};
-        if (_stat64(localPath.c_str(), &st) == 0) {
-            impl_->progressTotal = (std::uint64_t)st.st_size;
-        }
+        const std::uint64_t sz = localFileSizeUtf8(localPath);
+        if (sz > 0) impl_->progressTotal = sz;
     }
 
     const long openFlags = resumeBytes > 0
@@ -458,7 +489,7 @@ SftpResult SftpSession::upload(const std::string& localPath,
     }
     if (resumeBytes > 0) {
         libssh2_sftp_seek64(h, resumeBytes);
-        if (std::fseek(f, (long)resumeBytes, SEEK_SET) != 0) {
+        if (_fseeki64(f, (__int64)resumeBytes, SEEK_SET) != 0) {
             libssh2_sftp_close(h); std::fclose(f);
             return {SftpStatus::IoError, "local seek failed: " + localPath};
         }
@@ -505,6 +536,7 @@ SftpResult SftpSession::upload(const std::string& localPath,
             if (bytesMoved) *bytesMoved = moved;
         }
         if (aborted || !result.ok()) break;
+        throttle(ctl, got);   // respect the global rate limit (chunk bytes)
         if (impl_->onProgress) impl_->onProgress(moved, impl_->progressTotal);
     }
 
@@ -680,6 +712,9 @@ ListingPage SftpSession::list(const std::string&, const std::string&, std::uint3
     return {};
 }
 SftpResult SftpSession::size(const std::string&, std::uint64_t*) {
+    return {SftpStatus::EngineUnavailable, "built without libssh2"};
+}
+SftpResult SftpSession::stat(const std::string&, RemoteStat*) {
     return {SftpStatus::EngineUnavailable, "built without libssh2"};
 }
 SftpResult SftpSession::download(const std::string&, const std::string&,

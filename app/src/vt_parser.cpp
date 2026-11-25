@@ -6,11 +6,6 @@
 
 namespace ftpflow {
 
-const std::uint32_t VtParser::kPalette[16] = {
-    0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xc0c0c0,
-    0x808080, 0xff0000, 0x00ff00, 0xffff00, 0x0000ff, 0xff00ff, 0x00ffff, 0xffffff,
-};
-
 namespace {
 
 // Parse a list of CSI params separated by ';'. Missing/empty params are -1
@@ -40,29 +35,8 @@ int pAt(const std::vector<int>& v, std::size_t i, int def) {
 TermColor VtParser::indexedColor(int idx) {
     TermColor c;
     if (idx < 0 || idx > 255) return c;
-    if (idx < 16) {
-        const std::uint32_t rgb = kPalette[idx];
-        c.kind = TermColor::Kind::Rgb;
-        c.r = (rgb >> 16) & 0xff;
-        c.g = (rgb >> 8) & 0xff;
-        c.b = rgb & 0xff;
-        return c;
-    }
-    if (idx < 232) {
-        // 6x6x6 cube: 16 + 36r + 6g + b.
-        const int n = idx - 16;
-        const int r = n / 36, g = (n % 36) / 6, b = n % 6;
-        const auto level = [](int v) -> std::uint8_t {
-            return v == 0 ? 0 : (std::uint8_t)(55 + v * 40);
-        };
-        c.kind = TermColor::Kind::Rgb;
-        c.r = level(r); c.g = level(g); c.b = level(b);
-        return c;
-    }
-    // Grayscale: 232..255.
-    const std::uint8_t v = (std::uint8_t)(8 + (idx - 232) * 10);
-    c.kind = TermColor::Kind::Rgb;
-    c.r = c.g = c.b = v;
+    c.kind = TermColor::Kind::Indexed;
+    c.idx = static_cast<std::uint8_t>(idx);
     return c;
 }
 
@@ -71,23 +45,33 @@ void VtParser::feed(const char* data, std::size_t len) {
         const unsigned char c = static_cast<unsigned char>(data[i]);
         switch (state_) {
         case State::Ground:
-            if (c == 0x1b) state_ = State::Esc;
-            else dispatchChar(c);
+            if (c == 0x1b) {
+                utf8Need_ = 0;   // abandon any half-read UTF-8 sequence
+                state_ = State::Esc;
+            }
+            else feedByte(c);
             break;
 
         case State::Esc:
+            // Every two-byte ESC sequence ends back in Ground; only the
+            // string/CSI/OSC introducers switch to a consuming state. (The
+            // final-byte handlers used to fall through without resetting,
+            // which swallowed the next printable byte after ESC 7/8/M/D/E.)
+            state_ = State::Ground;
             if (c == '[') { state_ = State::Csi; csiParams_.clear(); }
             else if (c == ']') { state_ = State::Osc; oscBuf_.clear(); }
-            else if (c == '(' || c == ')') { state_ = State::String; strBuf_.clear(); }
-            else if (c == '7') { /* DECSC save cursor: not tracked (no-op) */ }
-            else if (c == '8') { /* DECRC restore cursor: no-op */ }
-            else if (c == 'M') buf_.scrollUp(1);      // reverse index
-            else if (c == 'D') buf_.newline();        // IND
-            else if (c == 'E') buf_.newline();        // NEL
+            else if (c == '(' || c == ')') { state_ = State::Charset; }
+            else if (c == 'P' || c == '^' || c == '_') {
+                state_ = State::String; strBuf_.clear(); strTerm_ = 0;
+            }
+            else if (c == '7') buf_.saveCursor();       // DECSC
+            else if (c == '8') buf_.restoreCursor();    // DECRC
+            else if (c == 'M') buf_.reverseIndex();     // RI
+            else if (c == 'D') buf_.index();            // IND
+            else if (c == 'E') buf_.newline();          // NEL
             else if (c == 'c') { /* RIS reset: no-op */ }
             else if (c == '=' || c == '>') { /* keypad mode: ignored */ }
-            else state_ = State::Ground;   // unknown ESC: ignore
-            break;
+            break;   // unknown ESC: ignore
 
         case State::Csi:
             if (c >= 0x40 && c <= 0x7e) {   // final byte
@@ -109,11 +93,25 @@ void VtParser::feed(const char* data, std::size_t len) {
             else { oscBuf_.push_back(static_cast<char>(c)); state_ = State::Osc; }
             break;
 
+        case State::Charset:
+            // ESC ( X / ESC ) X selects a character set. The designator is
+            // exactly ONE byte; treating this as an open-ended string used to
+            // swallow everything until the next backslash (e.g. the \g in a
+            // MySQL banner), making later output -- including the prompt --
+            // disappear from the terminal.
+            state_ = State::Ground;
+            break;
+
         case State::String:
-            // Consume a string sequence until ST (ESC \).
-            if (c == 0x1b) { /* pending ST */ }
-            else if (c == '\\') state_ = State::Ground;
-            // else: discard
+            // ST-terminated string (DCS/SOS/APC). Only a backslash preceded
+            // by ESC ends it; a bare backslash is just data.
+            if (c == 0x1b) strTerm_ = 0x1b;
+            else if (strTerm_ == 0x1b && c == '\\') {
+                strTerm_ = 0;
+                state_ = State::Ground;
+            } else {
+                strTerm_ = 0;
+            }
             break;
         }
     }
@@ -131,6 +129,37 @@ void VtParser::dispatchChar(std::uint32_t ch) {
         case 0x7f: break;                       // DEL: ignore
         default: buf_.putChar(ch); break;
     }
+}
+
+// Assemble multi-byte UTF-8 into single code points before dispatching.
+// Previously every byte became its own cell, so Chinese output rendered as
+// mojibake (one Latin-1 glyph per UTF-8 byte). Sequences that straddle
+// feed() calls are held in utf8Acc_/utf8Need_ until complete. Invalid or
+// stray bytes fall back to the legacy Latin-1 behavior so nothing is lost.
+void VtParser::feedByte(unsigned char c) {
+    if (c < 0x80) {
+        utf8Need_ = 0;   // control/ASCII: abandon any broken sequence
+        dispatchChar(c);
+        return;
+    }
+    if ((c & 0xC0) == 0x80) {   // continuation byte
+        if (utf8Need_ > 0) {
+            utf8Acc_ = (utf8Acc_ << 6) | (c & 0x3F);
+            if (--utf8Need_ == 0) dispatchChar(utf8Acc_);
+        } else {
+            dispatchChar(c);    // stray continuation: legacy fallback
+        }
+        return;
+    }
+    // Lead byte: flush a broken sequence first, then start a new one.
+    if (utf8Need_ > 0) {
+        dispatchChar(0xFFFD);
+        utf8Need_ = 0;
+    }
+    if ((c & 0xE0) == 0xC0)      { utf8Acc_ = c & 0x1F; utf8Need_ = 1; }
+    else if ((c & 0xF0) == 0xE0) { utf8Acc_ = c & 0x0F; utf8Need_ = 2; }
+    else if ((c & 0xF8) == 0xF0) { utf8Acc_ = c & 0x07; utf8Need_ = 3; }
+    else dispatchChar(c);        // invalid lead byte: legacy fallback
 }
 
 void VtParser::processCsi(char final) {
@@ -151,7 +180,8 @@ void VtParser::processCsi(char final) {
             switch (pAt(p, 0, 0)) {
                 case 0: buf_.clearToEnd(); break;
                 case 1: buf_.clearToBeginning(); break;
-                case 2: case 3: buf_.clearAll(); break;
+                case 2: buf_.clearAll(); break;
+                case 3: buf_.clearAll(); buf_.clearHistory(); break;
             }
             break;
         case 'K':
@@ -227,9 +257,14 @@ void VtParser::processCsi(char final) {
 }
 
 void VtParser::processOsc(const std::string& payload) {
-    // OSC 0/2 set the window title; OSC 8 hyperlinks. Neither affects the
-    // grid, so ignore everything.
-    (void)payload;
+    // OSC 0/2 set the window/tab title; everything else (OSC 8 hyperlinks,
+    // color queries, ...) does not affect the grid and is ignored.
+    const std::size_t semi = payload.find(';');
+    if (semi == std::string::npos) return;
+    const std::string code = payload.substr(0, semi);
+    if ((code == "0" || code == "2") && titleCb_) {
+        titleCb_(payload.substr(semi + 1));
+    }
 }
 
 void VtParser::applySgr(int code) {

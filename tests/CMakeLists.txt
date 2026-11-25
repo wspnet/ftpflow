@@ -36,9 +36,18 @@ add_executable(test_transfer_queue test_transfer_queue.cpp)
 target_link_libraries(test_transfer_queue PRIVATE ftpflow_core ws2_32)
 target_compile_features(test_transfer_queue PRIVATE cxx_std_17)
 
+add_executable(test_queue_stop test_queue_stop.cpp)
+target_link_libraries(test_queue_stop PRIVATE ftpflow_core ws2_32)
+target_compile_features(test_queue_stop PRIVATE cxx_std_17)
+
 add_executable(test_tree_walk test_tree_walk.cpp)
 target_link_libraries(test_tree_walk PRIVATE ftpflow_core ws2_32)
 target_compile_features(test_tree_walk PRIVATE cxx_std_17)
+
+# End-to-end same-name conflict handling over SFTP (local sshd + test key).
+add_executable(test_conflict_sftp test_conflict_sftp.cpp)
+target_link_libraries(test_conflict_sftp PRIVATE ftpflow_core ws2_32)
+target_compile_features(test_conflict_sftp PRIVATE cxx_std_17)
 
 add_executable(test_known_hosts test_known_hosts.cpp)
 target_link_libraries(test_known_hosts PRIVATE ftpflow_core)
@@ -48,9 +57,41 @@ add_executable(test_ftp_mlsd test_ftp_mlsd.cpp)
 target_link_libraries(test_ftp_mlsd PRIVATE ftpflow_core ws2_32)
 target_compile_features(test_ftp_mlsd PRIVATE cxx_std_17)
 
+add_executable(test_text_codec test_text_codec.cpp)
+target_link_libraries(test_text_codec PRIVATE ftpflow_core)
+target_compile_features(test_text_codec PRIVATE cxx_std_17)
+
+# End-to-end GBK navigation check (needs gbk_ftp_server.py on 127.0.0.1:2121).
+add_executable(test_gbk_navigate test_gbk_navigate.cpp)
+target_link_libraries(test_gbk_navigate PRIVATE ftpflow_core ws2_32)
+target_compile_features(test_gbk_navigate PRIVATE cxx_std_17)
+
+# End-to-end Chinese filename transfer check (needs a live FTP server).
+add_executable(test_chinese_transfer test_chinese_transfer.cpp)
+target_link_libraries(test_chinese_transfer PRIVATE ftpflow_core ws2_32)
+target_compile_features(test_chinese_transfer PRIVATE cxx_std_17)
+
 add_executable(test_ssh_exec test_ssh_exec.cpp)
 target_link_libraries(test_ssh_exec PRIVATE ftpflow_core ws2_32)
 target_compile_features(test_ssh_exec PRIVATE cxx_std_17)
+
+# Directory archive round-trip (needs zstd; skips cleanly otherwise).
+add_executable(test_dir_archive test_dir_archive.cpp)
+target_link_libraries(test_dir_archive PRIVATE ftpflow_core)
+target_compile_features(test_dir_archive PRIVATE cxx_std_17)
+if(FTPFLOW_WITH_ZSTD)
+    find_package(zstd CONFIG REQUIRED)
+    target_link_libraries(test_dir_archive PRIVATE zstd::libzstd)
+endif()
+
+# End-to-end directory-archive transfer (needs local sshd + test key).
+add_executable(test_dir_archive_transfer test_dir_archive_transfer.cpp)
+target_link_libraries(test_dir_archive_transfer PRIVATE ftpflow_core ws2_32)
+target_compile_features(test_dir_archive_transfer PRIVATE cxx_std_17)
+if(FTPFLOW_WITH_ZSTD)
+    find_package(zstd CONFIG REQUIRED)
+    target_link_libraries(test_dir_archive_transfer PRIVATE zstd::libzstd)
+endif()
 
 # Benchmark tool (not a test): 100k-entry enumeration budget from the
 # blueprint. Run manually: bench_list.exe [dir] [--create N]
@@ -70,6 +111,7 @@ add_test(NAME tree_walk COMMAND test_tree_walk)
 add_test(NAME known_hosts COMMAND test_known_hosts)
 add_test(NAME ftp_mlsd COMMAND test_ftp_mlsd)
 add_test(NAME ssh_exec COMMAND test_ssh_exec)
+add_test(NAME dir_archive COMMAND test_dir_archive)
 
 # Convenience target: build + run all tests in one step.
 add_custom_target(run_tests

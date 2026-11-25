@@ -126,6 +126,39 @@ static void makeFiller(const std::string& path, std::size_t totalBytes) {
 }
 
 int main() {
+    // ---- Part A0: same-name conflict decision logic (offline, pure) -----
+    {
+        using ftpflow::RemoteStat;
+        using ftpflow::smartShouldSkip;
+
+        RemoteStat src; src.exists = true; src.size = 100; src.mtimeUnix = 5;
+
+        // Destination missing -> never skip (overwrite).
+        RemoteStat absent;
+        CHECK(!smartShouldSkip(src, absent));
+
+        // Same size + same mtime -> skip.
+        RemoteStat same; same.exists = true; same.size = 100; same.mtimeUnix = 5;
+        CHECK(smartShouldSkip(src, same));
+
+        // Different size -> overwrite.
+        RemoteStat diffSize; diffSize.exists = true; diffSize.size = 200; diffSize.mtimeUnix = 5;
+        CHECK(!smartShouldSkip(src, diffSize));
+
+        // Different mtime (same size) -> overwrite.
+        RemoteStat diffTime; diffTime.exists = true; diffTime.size = 100; diffTime.mtimeUnix = 9;
+        CHECK(!smartShouldSkip(src, diffTime));
+
+        // Unknown mtime on either side (0) -> falls back to size-only:
+        // same size + unknown time -> skip (cannot prove it differs).
+        RemoteStat unknownTime; unknownTime.exists = true; unknownTime.size = 100; unknownTime.mtimeUnix = 0;
+        CHECK(smartShouldSkip(src, unknownTime));
+
+        // Directory destination is never "the same file" -> not skipped.
+        RemoteStat dir; dir.exists = true; dir.isDir = true; dir.size = 100; dir.mtimeUnix = 5;
+        CHECK(!smartShouldSkip(src, dir));
+    }
+
     // ---- Part A: offline dispatch/cancel/waitAll semantics --------------
     {
         ftpflow::TransferQueue q(1, 50);

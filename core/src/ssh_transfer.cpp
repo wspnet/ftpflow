@@ -6,6 +6,8 @@
 #include <thread>
 #include <vector>
 
+#include "ftpflow/text_codec.hpp"
+
 #if defined(FTPFLOW_HAVE_ZSTD)
 #include <zstd.h>
 #endif
@@ -29,7 +31,7 @@ SshResult sshPushFile(SshExec& ssh, const std::string& localPath,
                       const SshPushOptions& opts, SshPushStats* out) {
     if (!ssh.isOpen()) return {SshStatus::Closed, "channel not open"};
 
-    std::FILE* f = std::fopen(localPath.c_str(), "rb");
+    std::FILE* f = openLocalFile(localPath, "rb");
     if (!f) return {SshStatus::IoError, "cannot open local " + localPath};
     if (opts.resumeFrom > 0) {
         if (_fseeki64(f, (long long)opts.resumeFrom, SEEK_SET) != 0) {
@@ -90,7 +92,6 @@ SshResult sshPushFile(SshExec& ssh, const std::string& localPath,
         const std::size_t got = std::fread(in.data(), 1, in.size(), f);
         if (got == 0) break;
         st.localBytes += got;
-
         ZSTD_inBuffer zin{in.data(), got, 0};
         while (zin.pos < zin.size) {
             ZSTD_outBuffer zout{compressed.data(), compressed.size(), 0};
@@ -108,6 +109,7 @@ SshResult sshPushFile(SshExec& ssh, const std::string& localPath,
         if (channelDied) break;
         ssh.pump(0);   // non-blocking drain (EAGAIN-safe)
         if (!ssh.isOpen()) { channelDied = true; break; }
+        throttle(opts.control, got);   // respect the global rate limit
         if (opts.onProgress) opts.onProgress(st);
     }
     if (canceled) {

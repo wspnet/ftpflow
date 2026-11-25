@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "ftpflow/sha256.hpp"
+#include "ftpflow/text_codec.hpp"
 
 #if FTPFLOW_HAVE_ZSTD
 #include <zstd.h>
@@ -166,9 +167,9 @@ bool writeAll(std::FILE* f, const void* src, std::size_t n) {
 
 bool readAt(const std::string& path, std::uint64_t off, void* dst,
             std::size_t n) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = openLocalFile(path, "rb");
     if (!f) return false;
-    bool ok = std::fseek(f, static_cast<long>(off), SEEK_SET) == 0 &&
+    bool ok = _fseeki64(f, static_cast<__int64>(off), SEEK_SET) == 0 &&
               readExact(f, dst, n);
     std::fclose(f);
     return ok;
@@ -185,15 +186,17 @@ FtzStatus ftzWrite(const std::string& srcPath, const std::string& dstPath,
     const std::uint64_t frameBytes =
         static_cast<std::uint64_t>(frameMiB) * 1024 * 1024;
 
-    std::FILE* src = std::fopen(srcPath.c_str(), "rb");
+    std::FILE* src = openLocalFile(srcPath, "rb");
     if (!src) return FtzStatus::IoError;
-    std::fseek(src, 0, SEEK_END);
-    const long len = std::ftell(src);
-    std::fseek(src, 0, SEEK_SET);
+    // 64-bit positions: 32-bit ftell wraps at 2 GB and would corrupt both
+    // the frame walk and the resume offsets.
+    _fseeki64(src, 0, SEEK_END);
+    const __int64 len = _ftelli64(src);
+    _fseeki64(src, 0, SEEK_SET);
     if (len < 0) { std::fclose(src); return FtzStatus::IoError; }
     const std::uint64_t total = static_cast<std::uint64_t>(len);
 
-    std::FILE* dst = std::fopen(dstPath.c_str(), "wb");
+    std::FILE* dst = openLocalFile(dstPath, "wb");
     if (!dst) { std::fclose(src); return FtzStatus::IoError; }
 
     FtzInfo info;
@@ -230,7 +233,7 @@ FtzStatus ftzWrite(const std::string& srcPath, const std::string& dstPath,
         const bool useRaw = ZSTD_isError(produced) || produced >= chunk;
 
         FtzFrameEntry entry;
-        entry.offset = static_cast<std::uint64_t>(std::ftell(dst));
+        entry.offset = static_cast<std::uint64_t>(_ftelli64(dst));
         entry.plainSize = chunk;
         entry.raw = useRaw;
         const void* payload = nullptr;
@@ -260,9 +263,15 @@ FtzStatus ftzWrite(const std::string& srcPath, const std::string& dstPath,
     std::memcpy(info.originalSha256, digest.data(), 32);
     info.frameCount = static_cast<std::uint32_t>(info.frames.size());
 
-    // Manifest at the tail, then patch the header.
+    // Manifest at the tail, then patch the header. The on-disk manifest
+    // offset is u32 (format v1), so a container whose tail lands past 4 GiB
+    // cannot be represented -- fail instead of silently truncating it.
     std::vector<std::uint8_t> manifest = encodeManifest(info);
-    info.manifestOffset = static_cast<std::uint32_t>(std::ftell(dst));
+    const __int64 manifestPos = _ftelli64(dst);
+    if (manifestPos < 0 || manifestPos > 0xFFFFFFFFll) {
+        std::fclose(dst); return FtzStatus::IoError;
+    }
+    info.manifestOffset = static_cast<std::uint32_t>(manifestPos);
     if (!writeAll(dst, manifest.data(), manifest.size())) {
         std::fclose(dst); return FtzStatus::IoError;
     }
@@ -282,7 +291,7 @@ FtzStatus ftzWrite(const std::string& srcPath, const std::string& dstPath,
     put32(16, info.manifestOffset);
     for (int i = 0; i < 8; ++i)
         header[24 + i] = static_cast<std::uint8_t>(total >> (8 * i));
-    if (std::fseek(dst, 0, SEEK_SET) != 0 ||
+    if (_fseeki64(dst, 0, SEEK_SET) != 0 ||
         !writeAll(dst, header, sizeof(header))) {
         std::fclose(dst); return FtzStatus::IoError;
     }
@@ -407,7 +416,7 @@ FtzStatus ftzExtract(const std::string& ftzPath, const std::string& dstPath,
     FtzStatus st = ftzOpen(ftzPath, info);
     if (st != FtzStatus::Ok) return st;
 
-    std::FILE* dst = std::fopen(dstPath.c_str(), "wb");
+    std::FILE* dst = openLocalFile(dstPath, "wb");
     if (!dst) return FtzStatus::IoError;
 
     Sha256 wholeFile;

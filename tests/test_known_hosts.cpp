@@ -1,6 +1,7 @@
 // ftpflow tests -- known_hosts store + fingerprints.
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -192,6 +193,67 @@ int main() {
         CHECK(kh.load(out, &err));   // trivially true
         CHECK(kh.trust("x", 22, "ssh-rsa", fakeBlob('D'), &err));
         CHECK(kh.trustedHexFor("x", 22).empty());
+    }
+
+    // ---- store: @revoked marker round-trips and blocks trust -------------
+    {
+        const std::string rev = tmpPath("test_known_hosts_revoked.dat");
+        std::remove(rev.c_str());
+        const std::string blob = fakeBlob('R');
+        {
+            KnownHosts kh(rev);
+            std::vector<KnownHostEntry> entries;
+            KnownHostEntry e; e.host = "bad.example"; e.port = 22;
+            e.keyType = "ssh-rsa"; e.blob = blob; e.revoked = true;
+            entries.push_back(e);
+            std::string err;
+            CHECK(kh.save(entries, &err));
+
+            std::vector<KnownHostEntry> loaded;
+            CHECK(kh.load(loaded, &err));
+            CHECK(loaded.size() == 1);
+            CHECK(loaded[0].revoked);
+            CHECK(loaded[0].blob == blob);
+
+            // A revoked key is never "trusted" and isRevoked confirms it.
+            CHECK(kh.trustedHexFor("bad.example", 22).empty());
+            CHECK(kh.isRevoked("bad.example", 22, blob));
+            CHECK(!kh.contains("bad.example", 22, blob));
+
+            // trust() must refuse to resurrect a revoked key.
+            CHECK(!kh.trust("bad.example", 22, "ssh-rsa", blob, &err));
+
+            // A different key can be trusted; the revocation survives and
+            // is not replaced away.
+            const std::string other = fakeBlob('O');
+            CHECK(kh.trust("bad.example", 22, "ssh-rsa", other, &err));
+            CHECK(kh.contains("bad.example", 22, other));
+            CHECK(kh.isRevoked("bad.example", 22, blob));
+
+            // forget drops the trusted copy but keeps the revocation.
+            CHECK(kh.forget("bad.example", 22, &err));
+            CHECK(!kh.contains("bad.example", 22, other));
+            CHECK(kh.isRevoked("bad.example", 22, blob));
+        }
+        std::remove(rev.c_str());
+    }
+
+    // ---- store: exists-but-unreadable fails load (no silent TOFU) --------
+    {
+        // A DIRECTORY sitting at the store path: opening it as a file fails
+        // even though the path exists. load() must return false (callers
+        // then fail the connection) instead of pretending "empty store".
+        const std::string dirPath = tmpPath("test_known_hosts_dir.dat");
+        std::filesystem::create_directory(dirPath);
+        KnownHosts kh(dirPath);
+        std::vector<KnownHostEntry> out;
+        std::string err;
+        CHECK(!kh.load(out, &err));
+        CHECK(!err.empty());
+        bool storeOk = true;
+        CHECK(kh.trustedHexFor("x", 22, &storeOk).empty());
+        CHECK(!storeOk);
+        std::filesystem::remove(dirPath);
     }
 
     std::remove(path.c_str());

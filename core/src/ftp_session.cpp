@@ -1,10 +1,13 @@
 // ftpflow -- FTP/FTPS session implementation (libcurl, Schannel).
 #include "ftpflow/ftp_session.hpp"
+#include "ftpflow/text_codec.hpp"
 
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <thread>
 
 #if defined(FTPFLOW_HAVE_CURL)
@@ -31,6 +34,64 @@ std::string trim(const std::string& s) {
 }
 
 // ---- LIST line parsers ------------------------------------------------------
+
+// Parse the "Jan 12 09:33" / "Jan 12 2024" tail of a Unix LIST line into an
+// epoch timestamp (seconds, local time). Returns 0 on any parse error. This is
+// a pragmatic best-effort: LIST carries no timezone, so we interpret the
+// server-local stamp in the client's local zone (right for most self-hosted
+// / LAN servers). MLSD is still preferred when available.
+std::int64_t parseUnixListTime(const std::string& mon, const std::string& day,
+                               const std::string& yearOrTime) {
+    static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    int m = -1;
+    for (int k = 0; k < 12; ++k)
+        if (mon.size() == 3 && mon[0] == months[k][0] &&
+            mon[1] == months[k][1] && mon[2] == months[k][2]) { m = k + 1; break; }
+    if (m < 0) return 0;
+    int d = 0;
+    for (char c : day) {
+        if (c < '0' || c > '9') return 0;
+        d = d * 10 + (c - '0');
+    }
+    if (d < 1 || d > 31) return 0;
+
+    int year = 0, hh = 0, mm = 0;
+    const bool hasColon = yearOrTime.find(':') != std::string::npos;
+    if (hasColon) {
+        // "HH:MM" -> current year.
+        if (yearOrTime.size() < 4 || yearOrTime[2] != ':') return 0;
+        hh = (yearOrTime[0] - '0') * 10 + (yearOrTime[1] - '0');
+        mm = (yearOrTime[3] - '0') * 10 + (yearOrTime[4] - '0');
+        const std::time_t now = std::time(nullptr);
+        std::tm lt{};
+#if defined(_WIN32)
+        localtime_s(&lt, &now);
+#else
+        localtime_r(&now, &lt);
+#endif
+        year = lt.tm_year + 1900;
+    } else {
+        // "YYYY".
+        if (yearOrTime.size() != 4) return 0;
+        for (char c : yearOrTime)
+            if (c < '0' || c > '9') return 0;
+        year = (yearOrTime[0] - '0') * 1000 + (yearOrTime[1] - '0') * 100 +
+               (yearOrTime[2] - '0') * 10 + (yearOrTime[3] - '0');
+    }
+    if (hh > 23 || mm > 59) return 0;
+
+    std::tm t{};
+    t.tm_year = year - 1900;
+    t.tm_mon = m - 1;
+    t.tm_mday = d;
+    t.tm_hour = hh;
+    t.tm_min = mm;
+    t.tm_sec = 0;
+    t.tm_isdst = -1;
+    const std::time_t ts = std::mktime(&t);
+    return ts == (std::time_t)-1 ? 0 : (std::int64_t)ts;
+}
 
 bool parseUnixListLine(const std::string& line, Entry& e) {
     // "-rw-r--r-- 1 owner group 12345 Jan 12 09:33 name" / "drwx... d name"
@@ -59,33 +120,86 @@ bool parseUnixListLine(const std::string& line, Entry& e) {
     if (name.empty()) return false;
     e.name = name;
     e.size = std::strtoull(tok[4].c_str(), nullptr, 10);
-    // Date: tok[5] month, tok[6] day, tok[7] year-or-time. Keep mtime 0:
-    // parsing server-local dates without a tz is a trap we avoid; the UI
-    // shows it as "-" until MLSD-style data lands.
+    // Date: tok[5] month, tok[6] day, tok[7] year-or-time. Best-effort local
+    // parse (LIST has no timezone); MLSD is preferred and carries real UTC.
+    e.mtimeUnix = parseUnixListTime(tok[5], tok[6], tok[7]);
     return true;
 }
 
 bool parseDosListLine(const std::string& line, Entry& e) {
-    // "01-12-26  09:33PM                  12345 name"
+    // IIS / DOS FTP listing, four whitespace-separated fields followed by a
+    // name that may contain spaces:
+    //   "08-26-26  11:51AM       <DIR>          Areas"
+    //   "08-26-26  11:50AM                   49 PrecompiledApp.config"
+    //   "01-12-26  09:33PM                 12345 name with spaces"
     if (line.size() < 18) return false;
-    const std::string date = line.substr(0, 10);
-    if (date[2] != '-' || date[5] != '-') return false;
+    const std::string date = line.substr(0, 8);
+    if (date.size() < 8 || date[2] != '-' || date[5] != '-') return false;
     for (char c : date)
         if (c != '-' && (c < '0' || c > '9')) return false;
-    const std::string rest = trim(line.substr(10));
-    std::size_t sp = rest.find(' ');
-    if (sp == std::string::npos) return false;
-    const std::string name = trim(rest.substr(sp + 1));
-    if (name.empty()) return false;
-    const std::string sizeTok = rest.substr(0, sp);
+
+    // Tokenize the remainder after the fixed date field.
+    const std::string rest = trim(line.substr(8));
+    std::vector<std::string> tok;
+    std::size_t i = 0;
+    while (i < rest.size()) {
+        while (i < rest.size() && rest[i] == ' ') ++i;
+        std::size_t start = i;
+        while (i < rest.size() && rest[i] != ' ') ++i;
+        if (i > start) tok.push_back(rest.substr(start, i - start));
+    }
+    // Need at least: [time, size-or-<DIR>, name...]
+    if (tok.size() < 3) return false;
+
+    // tok[0] is the time ("11:51AM" / "09:33PM"); tok[1] is "<DIR>" or a
+    // decimal size; tok[2..] join into the name (may contain spaces).
+    const std::string& sizeTok = tok[1];
     if (sizeTok == "<DIR>") {
         e.type = EntryType::Directory;
         e.size = 0;
     } else {
+        // Reject a non-numeric token (e.g. a stray listing line).
+        for (char c : sizeTok)
+            if (c < '0' || c > '9') return false;
         e.type = EntryType::File;
         e.size = std::strtoull(sizeTok.c_str(), nullptr, 10);
     }
+    std::string name;
+    for (std::size_t k = 2; k < tok.size(); ++k) {
+        if (!name.empty()) name += ' ';
+        name += tok[k];
+    }
+    if (name.empty()) return false;
     e.name = name;
+    // Best-effort mtime from the DOS date/time fields (local time, no tz).
+    // date = "MM-DD-YY"; tok[0] = "HH:MM" + optional "AM"/"PM".
+    {
+        auto d2 = [&](std::size_t i) { return (date[i] - '0') * 10 + (date[i + 1] - '0'); };
+        const int mo = d2(0), dd = d2(3), yy = d2(6);
+        const std::string& t = tok[0];
+        if (mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31 && t.size() >= 4 &&
+            t[2] == ':') {
+            int hh = (t[0] - '0') * 10 + (t[1] - '0');
+            int mm = (t[3] - '0') * 10 + (t[4] - '0');
+            bool pm = false;
+            for (char c : t)
+                if (c == 'P' || c == 'p') pm = true;
+            if (pm && hh < 12) hh += 12;
+            if (!pm && hh == 12) hh = 0;
+            if (hh <= 23 && mm <= 59) {
+                const int year = 2000 + yy;
+                std::tm tm{};
+                tm.tm_year = year - 1900;
+                tm.tm_mon = mo - 1;
+                tm.tm_mday = dd;
+                tm.tm_hour = hh;
+                tm.tm_min = mm;
+                tm.tm_isdst = -1;
+                const std::time_t ts = std::mktime(&tm);
+                if (ts != (std::time_t)-1) e.mtimeUnix = (std::int64_t)ts;
+            }
+        }
+    }
     return true;
 }
 
@@ -135,6 +249,24 @@ int traceDump(CURL*, curl_infotype type, char* data, std::size_t size, void*) {
     return 0;
 }
 
+bool wantVerbose();   // defined just below
+
+// During the login probe we collect the server's control-channel responses
+// (the 220/230 greeting). A Chinese IIS serves that greeting in GBK, which
+// is a reliable signal that path bytes on this server must be GBK, not
+// UTF-8. Used only while FtpOptions::encoding == "auto" is still unresolved:
+// list() can only lock GBK after seeing a Chinese *filename*, so a directory
+// containing only ASCII names would otherwise leave "auto" in place and a
+// brand-new Chinese-named upload would send UTF-8 bytes that the server
+// rejects at STOR (CURLE_UPLOAD_FAILED, "Upload failed ... before it took off").
+int collectCtrlResponse(CURL*, curl_infotype type, char* data,
+                        std::size_t size, void* userp) {
+    if (type == CURLINFO_HEADER_IN && data && size && userp)
+        static_cast<std::string*>(userp)->append(data, size);
+    if (wantVerbose()) return traceDump(nullptr, type, data, size, nullptr);
+    return 0;
+}
+
 bool wantVerbose() {
     const char* v = std::getenv("FTPFLOW_FTP_VERBOSE");
     return v && *v && *v != '0';
@@ -147,6 +279,7 @@ struct XferCtx {
     std::function<void(std::uint64_t, std::uint64_t)> onProgress;
     const TransferControl* ctl = nullptr;   // set per transfer call
     volatile bool isUpload = false;
+    std::uint64_t lastBytes = 0;   // for chunk-delta rate limiting
 };
 
 // libcurl progress hook: parks while paused, returns nonzero to abort on
@@ -167,6 +300,12 @@ int xferInfo(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
                                        : (std::uint64_t)dltotal;
         const std::uint64_t now = up ? (std::uint64_t)ulnow
                                      : (std::uint64_t)dlnow;
+        // Chunk-delta rate limiting: throttle on the bytes moved since the
+        // last callback so curl's transfer obeys the global limit.
+        if (ctx->ctl && now > ctx->lastBytes) {
+            throttle(ctx->ctl, now - ctx->lastBytes);
+        }
+        ctx->lastBytes = now;
         ctx->onProgress(now, total);
     }
     return 0;
@@ -174,16 +313,42 @@ int xferInfo(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
 
 // Builds "scheme://host[:port] + normalized path". The path always gets a
 // leading '/'; `trailingSlash` appends one for directory listings.
+//
+// The path arrives as UTF-8 (what the UI holds and what list() produced).
+// FTP has no mandated filename encoding, so the bytes curl puts on the wire
+// for CWD/LIST/DELE/etc. must match what the server expects: on a GBK box
+// (Chinese IIS) that is GBK bytes, not UTF-8. `encoding` (from FtpOptions)
+// drives the reverse conversion via fromUtf8().
 std::string makeUrl(const FtpOptions& opt, const std::string& path,
                     bool trailingSlash) {
     const std::string scheme = opt.implicitTls ? "ftps" : "ftp";
     std::string url = scheme + "://" + opt.host;
     if (opt.port != 0 && opt.port != 21 && opt.port != 990)
         url += ":" + std::to_string(opt.port);
-    std::string p = path;
-    if (p.empty() || p[0] != '/') p = "/" + p;
-    if (trailingSlash && p.back() != '/') p += "/";
-    return url + p;
+    // UTF-8 path -> server-encoding bytes, then percent-encode anything that
+    // is not a URL-safe path byte. Curl decodes %XX back to raw bytes before
+    // issuing CWD, so a GBK name survives the URL round-trip intact. Bytes
+    // that are already ASCII (e.g. '/', alphanumerics) pass through as-is.
+    const std::string p = fromUtf8(path, opt.encoding);
+    std::string esc;
+    esc.reserve(p.size() * 3);
+    for (unsigned char c : p) {
+        if (c == '/' || c == '.') {
+            esc.push_back((char)c);
+        } else if (std::isalnum(c) || c == '-' || c == '_' || c == '~') {
+            esc.push_back((char)c);
+        } else {
+            static const char* hex = "0123456789ABCDEF";
+            esc.push_back('%');
+            esc.push_back(hex[c >> 4]);
+            esc.push_back(hex[c & 0xF]);
+        }
+    }
+    std::string out = url;
+    if (esc.empty() || esc[0] != '/') out += "/";
+    out += esc;
+    if (trailingSlash && (out.empty() || out.back() != '/')) out += "/";
+    return out;
 }
 
 }  // namespace
@@ -271,6 +436,15 @@ struct FtpSession::Impl {
     std::string listBuf;
     int lastCurlErr = CURLE_OK;   // most recent curl result code
     bool mlsdOk = false;          // server accepted MLSD (probed on first list)
+    // Physical root the server drops us into after login (CURLINFO_FTP_ENTRY_PATH).
+    // On IIS user isolation this is the user's virtual root (e.g. /zmailvip163com8),
+    // NOT "/". We prefix it to every absolute path we hand to the server so that
+    // `CWD /wwwroot` (which the server resolves against the *physical* root and
+    // would reject with 550) becomes `CWD /zmailvip163com8/wwwroot`.
+    std::string homeDir;
+    // Scratch buffer used only during open()'s login probe to capture the
+    // control-channel greeting for auto encoding detection.
+    std::string ctrlGreeting;
     XferCtx xfer;   // progress/control state shared with the XFERINFO hook
 };
 
@@ -306,9 +480,17 @@ FtpResult FtpSession::open(const FtpOptions& opt) {
     ::curl_easy_setopt(impl_->easy, CURLOPT_NOPROGRESS, 0L);
     ::curl_easy_setopt(impl_->easy, CURLOPT_XFERINFOFUNCTION, xferInfo);
     ::curl_easy_setopt(impl_->easy, CURLOPT_XFERINFODATA, &impl_->xfer);
-    if (wantVerbose()) {
+    // When the encoding is still "auto", inspect the login greeting to
+    // resolve it up front. Otherwise a Chinese upload into an ASCII-only
+    // directory sends UTF-8 bytes to a GBK server and fails at STOR.
+    const bool probeGreeting = (opt.encoding == "auto");
+    if (probeGreeting) impl_->ctrlGreeting.clear();
+    if (probeGreeting || wantVerbose()) {
         ::curl_easy_setopt(impl_->easy, CURLOPT_VERBOSE, 1L);
-        ::curl_easy_setopt(impl_->easy, CURLOPT_DEBUGFUNCTION, traceDump);
+        ::curl_easy_setopt(impl_->easy, CURLOPT_DEBUGFUNCTION,
+                           probeGreeting ? collectCtrlResponse : traceDump);
+        ::curl_easy_setopt(impl_->easy, CURLOPT_DEBUGDATA,
+                           probeGreeting ? &impl_->ctrlGreeting : nullptr);
     }
 
     // Base URL: scheme://host[:port]
@@ -323,6 +505,12 @@ FtpResult FtpSession::open(const FtpOptions& opt) {
     ::curl_easy_setopt(impl_->easy, CURLOPT_CONNECTTIMEOUT_MS,
                        static_cast<long>(opt.connectTimeoutMs));
     ::curl_easy_setopt(impl_->easy, CURLOPT_FTP_RESPONSE_TIMEOUT, 30L);
+    // Hard ceiling on the whole connect/auth handshake (DNS + TCP + PWD).
+    // CONNECTTIMEOUT_MS does not cover DNS resolution, and a misbehaving
+    // server that accepts the socket but stalls the login would otherwise
+    // leave the UI stuck on "connecting" indefinitely.
+    ::curl_easy_setopt(impl_->easy, CURLOPT_TIMEOUT_MS,
+                       static_cast<long>(opt.connectTimeoutMs) * 3L);
     if (opt.tls && !opt.implicitTls) {
         ::curl_easy_setopt(impl_->easy, CURLOPT_USE_SSL, (long)CURLUSESSL_ALL);
         ::curl_easy_setopt(impl_->easy, CURLOPT_FTPSSLAUTH,
@@ -341,6 +529,27 @@ FtpResult FtpSession::open(const FtpOptions& opt) {
     ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 1L);
     CURLcode rc = ::curl_easy_perform(impl_->easy);
     ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 0L);
+    if (probeGreeting) {
+        // Stop collecting and restore the ordinary verbose hook (if any).
+        ::curl_easy_setopt(impl_->easy, CURLOPT_VERBOSE, 0L);
+        ::curl_easy_setopt(impl_->easy, CURLOPT_DEBUGFUNCTION, nullptr);
+        ::curl_easy_setopt(impl_->easy, CURLOPT_DEBUGDATA, nullptr);
+        if (wantVerbose()) {
+            ::curl_easy_setopt(impl_->easy, CURLOPT_VERBOSE, 1L);
+            ::curl_easy_setopt(impl_->easy, CURLOPT_DEBUGFUNCTION, traceDump);
+        }
+        // A greeting that is not valid UTF-8 (a Chinese IIS sends GBK) means
+        // the server expects GBK path bytes. Lock it so every CWD/STOR/MKD
+        // from this session -- including the transfer queue's own independent
+        // FtpSession -- uses the correct encoding.
+        if (!impl_->ctrlGreeting.empty() &&
+            !isValidUtf8(impl_->ctrlGreeting))
+            opt_.encoding = "gbk";
+        impl_->ctrlGreeting.clear();
+    }
+    // Clear the whole-transfer ceiling set above so later transfers (large
+    // uploads/downloads) are not cut off at 30s.
+    ::curl_easy_setopt(impl_->easy, CURLOPT_TIMEOUT_MS, 0L);
     if (rc != CURLE_OK) {
         impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
         impl_->lastErr = *impl_->errBuf ? impl_->errBuf
@@ -352,6 +561,17 @@ FtpResult FtpSession::open(const FtpOptions& opt) {
         close();
         return {st, "connect/auth check (PWD): " + msg, rc};
     }
+    // Record the physical directory the server logged us into. On an ordinary
+    // server this is "/"; on IIS user isolation it is the user's virtual root
+    // (e.g. "/zmailvip163com8"). Every absolute path we later send over the
+    // control channel (CWD in quote commands) must be prefixed with it.
+    {
+        char* entryPath = nullptr;
+        if (::curl_easy_getinfo(impl_->easy, CURLINFO_FTP_ENTRY_PATH,
+                                &entryPath) == CURLE_OK && entryPath)
+            impl_->homeDir = entryPath;
+    }
+    if (impl_->homeDir.empty() || impl_->homeDir == "/") impl_->homeDir.clear();
     opened_ = true;
     return {};
 }
@@ -410,6 +630,80 @@ ListingPage FtpSession::list(const std::string& dir) {
         }
     }
     page.hasMore = false;  // whole listing in one page
+    // Convert filename bytes from the server's encoding to UTF-8 (FTP has
+    // no mandated encoding; Chinese IIS serves GBK while Linux servers
+    // serve UTF-8). Done once here so both MLSD and LIST paths are covered.
+    //
+    // In "auto" mode we additionally *learn* the server's encoding from this
+    // listing: if any name was not valid UTF-8 (i.e. had to be decoded as
+    // GBK), lock the session to GBK so that the reverse conversion in
+    // makeUrl()/quote commands (CWD into a Chinese directory, MKD/DELE/RMD,
+    // rename) sends GBK bytes instead of round-tripping UTF-8. Without this,
+    // a Chinese directory would list correctly but refuse to open with
+    // "Server denied you to change to the given directory".
+    const std::string userEncoding = opt_.encoding;
+    for (Entry& e : page.entries) {
+        if (userEncoding == "auto" && !isValidUtf8(e.name))
+            opt_.encoding = "gbk";  // lock before converting
+        e.name = toUtf8(e.name, userEncoding);
+    }
+    // A listing that produced no entries can hide two very different things:
+    // a genuinely empty directory, or a server whose MLSD/LIST payload the
+    // parsers could not recognize (a non-Unix/non-DOS format). Surface the
+    // latter so the UI shows a diagnostic instead of silently blank.
+    if (page.entries.empty() && !impl_->listBuf.empty()) {
+        std::string head = toUtf8(trim(impl_->listBuf), opt_.encoding);
+        if (head.size() > 160) head = head.substr(0, 160) + "...";
+        impl_->lastErr = "无法解析服务器目录列表: [" + head + "]";
+    }
+    return page;
+}
+
+ListingPage FtpSession::listAll(const std::string& dir) {
+    ListingPage page;
+    if (!opened_ || !impl_ || !impl_->easy) return page;
+
+    const std::string d = dir.empty() ? opt_.initialPath : dir;
+    // Force `LIST -a` (show hidden entries). Servers that hide dot-files /
+    // system files from the default listing make a directory look empty while
+    // RMD still fails with 550 ("not empty"); this surfaces those entries so
+    // recursive deletion can remove them. If the server rejects `-a` (or
+    // treats it as plain LIST), the result is identical to a normal LIST.
+    impl_->lastErr.clear();
+    impl_->listBuf.clear();
+    ::curl_easy_setopt(impl_->easy, CURLOPT_URL, makeUrl(opt_, d, true).c_str());
+    ::curl_easy_setopt(impl_->easy, CURLOPT_CUSTOMREQUEST, "LIST -a");
+    ::curl_easy_setopt(impl_->easy, CURLOPT_DIRLISTONLY, 1L);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEFUNCTION, appendToString);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_WRITEDATA, &impl_->listBuf);
+    CURLcode rc = ::curl_easy_perform(impl_->easy);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_CUSTOMREQUEST, nullptr);
+    ::curl_easy_setopt(impl_->easy, CURLOPT_DIRLISTONLY, 0L);
+    if (rc != CURLE_OK) {
+        impl_->lastCurlErr = (int)rc;
+        impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
+        impl_->lastErr = *impl_->errBuf ? impl_->errBuf
+                                        : ::curl_easy_strerror(rc);
+        impl_->lastErr = "list -a: " + impl_->lastErr;
+        return page;
+    }
+    std::size_t pos = 0;
+    while (pos < impl_->listBuf.size()) {
+        std::size_t nl = impl_->listBuf.find('\n', pos);
+        std::string line = impl_->listBuf.substr(
+            pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = nl == std::string::npos ? impl_->listBuf.size() : nl + 1;
+        Entry e;
+        if (parseListLine(trim(line), e)) page.entries.push_back(e);
+    }
+    page.hasMore = false;
+    // Same encoding conversion as list() (learn GBK in auto mode).
+    const std::string userEncoding = opt_.encoding;
+    for (Entry& e : page.entries) {
+        if (userEncoding == "auto" && !isValidUtf8(e.name))
+            opt_.encoding = "gbk";
+        e.name = toUtf8(e.name, userEncoding);
+    }
     return page;
 }
 
@@ -440,7 +734,6 @@ bool FtpSession::listViaMlsd(const std::string& dir, std::vector<Entry>& out) {
     // QUOTE/response error (non-CURLE_OK) above; if we got here the data
     // connection delivered MLSD lines. Parse them.
     std::size_t pos = 0;
-    bool any = false;
     while (pos < impl_->listBuf.size()) {
         std::size_t nl = impl_->listBuf.find('\n', pos);
         std::string line = impl_->listBuf.substr(
@@ -451,12 +744,18 @@ bool FtpSession::listViaMlsd(const std::string& dir, std::vector<Entry>& out) {
         Entry e;
         if (parseMlsdLine(line, e)) {
             out.push_back(std::move(e));
-            any = true;
         }
     }
-    // Even an empty directory yields well-formed MLSD (just zero entries);
-    // `any` guards against a server that echoed LIST text to MLSD.
-    (void)any;
+    // MLSD delivered zero entries. Two cases are indistinguishable here: a
+    // genuinely empty directory, or a server that "accepted" MLSD but sent
+    // an empty/foreign (LIST-style) payload. Fall back to the classic LIST
+    // parse to be safe -- a truly empty directory yields an empty LIST too,
+    // so the result stays correct, and a server without real MLSD gets its
+    // listing recovered.
+    if (out.empty()) {
+        impl_->lastErr = "MLSD returned no entries; retrying with LIST";
+        return false;
+    }
     impl_->lastErr.clear();
     return true;
 }
@@ -485,6 +784,27 @@ FtpResult FtpSession::size(const std::string& remotePath,
     return {};
 }
 
+FtpResult FtpSession::stat(const std::string& remotePath, RemoteStat* out) {
+    if (out) *out = RemoteStat{};
+    std::uint64_t size = 0;
+    FtpResult r = this->size(remotePath, &size);
+    if (!r.ok()) {
+        // CURLE_REMOTE_FILE_NOT_FOUND (78) means the file simply does not
+        // exist -- a normal "no conflict" answer, not an error.
+        if (r.curlCode == 78 /* CURLE_REMOTE_FILE_NOT_FOUND */) {
+            if (out) out->exists = false;
+            return {};
+        }
+        return r;
+    }
+    if (out) {
+        out->exists = true;
+        out->size = size;
+        out->mtimeUnix = 0;   // FTP: mtime not fetched (see header note)
+    }
+    return {};
+}
+
 FtpResult FtpSession::download(const std::string& remotePath,
                                const std::string& localPath,
                                std::uint64_t resumeBytes,
@@ -495,7 +815,7 @@ FtpResult FtpSession::download(const std::string& remotePath,
         return {FtpStatus::IoError, "session not open"};
 
     const char* mode = resumeBytes > 0 ? "ab" : "wb";
-    std::FILE* f = std::fopen(localPath.c_str(), mode);
+    std::FILE* f = openLocalFile(localPath, mode);
     if (!f) return {FtpStatus::IoError, "cannot open local " + localPath};
 
     impl_->xfer.ctl = ctl;
@@ -509,21 +829,29 @@ FtpResult FtpSession::download(const std::string& remotePath,
     CURLcode rc = ::curl_easy_perform(impl_->easy);
     std::fclose(f);
     impl_->xfer.ctl = nullptr;
+    // Bytes actually delivered to the write callback in THIS call. Do not use
+    // CONTENT_LENGTH (the announced size): it may be absent or stale and says
+    // nothing about how much really arrived -- truncation detection depends
+    // on the real counter.
+    std::uint64_t movedThisCall = 0;
+    {
+        curl_off_t sz = 0;
+        ::curl_easy_getinfo(impl_->easy, CURLINFO_SIZE_DOWNLOAD_T, &sz);
+        if (sz > 0) movedThisCall = static_cast<std::uint64_t>(sz);
+    }
+    if (bytesMoved) *bytesMoved = movedThisCall;
     if (rc == CURLE_ABORTED_BY_CALLBACK) {
         if (resumeBytes > 0)
             ::curl_easy_setopt(impl_->easy, CURLOPT_RESUME_FROM_LARGE,
                                static_cast<curl_off_t>(0));
         return {FtpStatus::Canceled, "canceled by caller", rc};
     }
-    if (rc != CURLE_PARTIAL_FILE && rc != CURLE_OK) {
+    if (rc != CURLE_OK) {
+        // CURLE_PARTIAL_FILE (link dropped mid-transfer) is a FAILURE: the
+        // local file is truncated. Reporting success here previously marked
+        // incomplete files Done with no way to tell.
         return {FtpStatus::DownloadFailed,
                 std::string("download: ") + ::curl_easy_strerror(rc), rc};
-    }
-    if (bytesMoved) {
-        double len = 0.0;
-        ::curl_easy_getinfo(impl_->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD,
-                            &len);
-        if (len > 0) *bytesMoved = static_cast<std::uint64_t>(len);
     }
     if (resumeBytes > 0)
         ::curl_easy_setopt(impl_->easy, CURLOPT_RESUME_FROM_LARGE,
@@ -540,11 +868,13 @@ FtpResult FtpSession::upload(const std::string& localPath,
     if (!opened_ || !impl_ || !impl_->easy)
         return {FtpStatus::IoError, "session not open"};
 
-    std::FILE* f = std::fopen(localPath.c_str(), "rb");
+    std::FILE* f = openLocalFile(localPath, "rb");
     if (!f) return {FtpStatus::IoError, "cannot open local " + localPath};
-    std::fseek(f, 0, SEEK_END);
-    const std::uint64_t fsize = static_cast<std::uint64_t>(std::ftell(f));
-    std::fseek(f, static_cast<long>(resumeBytes), SEEK_SET);
+    // 64-bit file positions: a plain ftell/fseek wraps at 2 GB and corrupts
+    // resume offsets for large files.
+    _fseeki64(f, 0, SEEK_END);
+    const std::uint64_t fsize = static_cast<std::uint64_t>(_ftelli64(f));
+    _fseeki64(f, static_cast<__int64>(resumeBytes), SEEK_SET);
 
     impl_->xfer.ctl = ctl;
     impl_->xfer.isUpload = true;
@@ -565,15 +895,25 @@ FtpResult FtpSession::upload(const std::string& localPath,
     ::curl_easy_setopt(impl_->easy, CURLOPT_UPLOAD, 0L);
     if (resumeBytes > 0)
         ::curl_easy_setopt(impl_->easy, CURLOPT_APPEND, 0L);
+    // Bytes actually sent to the server in THIS call (not the planned size:
+    // a broken link can cut the stream short without curl noticing until the
+    // end).
+    std::uint64_t movedThisCall = 0;
+    {
+        curl_off_t sz = 0;
+        ::curl_easy_getinfo(impl_->easy, CURLINFO_SIZE_UPLOAD_T, &sz);
+        if (sz > 0) movedThisCall = static_cast<std::uint64_t>(sz);
+    }
+    if (bytesMoved) *bytesMoved = movedThisCall;
     if (rc == CURLE_ABORTED_BY_CALLBACK) {
         return {FtpStatus::Canceled, "canceled by caller", rc};
     }
-    if (rc != CURLE_PARTIAL_FILE && rc != CURLE_OK) {
+    if (rc != CURLE_OK) {
+        // CURLE_PARTIAL_FILE means the server stopped reading early: the
+        // remote file is truncated and must not be reported as complete.
         return {FtpStatus::UploadFailed,
                 std::string("upload: ") + ::curl_easy_strerror(rc), rc};
     }
-    if (bytesMoved)
-        *bytesMoved = resumeBytes > 0 ? (fsize - resumeBytes) : fsize;
     return {};
 }
 
@@ -592,11 +932,46 @@ void FtpSession::setProgressCallback(
 // path first and aborts before the custom request when the path does
 // not exist yet (which is precisely the MKD case).
 
+// Splits a remote absolute path into (parentDir, baseName). parentDir keeps
+// its trailing slash (or is "/"), so it can be reused as a CWD target.
+static void splitRemotePath(const std::string& path, std::string& parent,
+                            std::string& base) {
+    const std::size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) {
+        parent = "/";
+        base = path;
+    } else if (slash == 0) {
+        parent = "/";
+        base = path.substr(1);
+    } else {
+        parent = path.substr(0, slash + 1);
+        base = path.substr(slash + 1);
+    }
+}
+
 #if defined(FTPFLOW_HAVE_CURL)
-FtpResult FtpSession::quoteCommand(const std::string& cmd) {
+FtpResult FtpSession::quoteCommand(const std::string& cwdDir,
+                                   const std::string& cmd) {
     if (!impl_ || !impl_->easy) return {FtpStatus::IoError, "not open"};
     impl_->lastErr.clear();
+    // CRITICAL: libcurl issues CURLOPT_QUOTE commands BEFORE its own CWD
+    // (see the CURLOPT_QUOTE docs: "even before the CWD command"). So a
+    // relative command like `DELE name` would run against whatever directory
+    // the connection was left in, NOT `cwdDir`. To make the relative form
+    // work on strict servers (IIS / Windows hosting panels) that reject
+    // absolute paths in DELE/RMD/MKD/RNFR, we CWD into the parent ourselves
+    // as the FIRST quote command, then issue the relative op.
+    //
+    // The CWD argument must be an *absolute* path (resolved from the physical
+    // filesystem root, so it is immune to whatever directory the connection
+    // was last left in). On IIS user isolation the login lands on a virtual
+    // root (e.g. /zmailvip163com8), so the internal path "/wwwroot" must be
+    // sent as "/zmailvip163com8/wwwroot"; an un-prefixed "/wwwroot" resolves
+    // against the physical root and is rejected with 550.
+    const std::string absCwd = toServerAbsPath(cwdDir);
     struct curl_slist* quote = nullptr;
+    quote = ::curl_slist_append(
+        quote, ("CWD " + fromUtf8(absCwd, opt_.encoding)).c_str());
     quote = ::curl_slist_append(quote, cmd.c_str());
     ::curl_easy_setopt(impl_->easy, CURLOPT_URL,
                        makeUrl(opt_, "/", true).c_str());
@@ -619,9 +994,31 @@ FtpResult FtpSession::quoteCommand(const std::string& cmd) {
 }
 #endif
 
+std::string FtpSession::toServerAbsPath(const std::string& path) const {
+    // Normalize the internal path (strip leading slashes; treat "." / empty
+    // as the root).
+    std::string rel = path;
+    while (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+    if (rel.empty() || rel == ".") {
+        // Root of the user's view -> the login directory itself.
+        return impl_ && !impl_->homeDir.empty() ? impl_->homeDir : "/";
+    }
+    if (!impl_ || impl_->homeDir.empty()) {
+        // Ordinary server: internal path is already physical-absolute.
+        return "/" + rel;
+    }
+    // IIS user isolation: prefix the login root so the server resolves the
+    // path against the *physical* root (where it actually lives).
+    std::string home = impl_->homeDir;
+    while (!home.empty() && home.back() == '/') home.pop_back();
+    return home + "/" + rel;
+}
+
 FtpResult FtpSession::mkdir(const std::string& remotePath) {
 #if defined(FTPFLOW_HAVE_CURL)
-    return quoteCommand("MKD " + remotePath);
+    std::string parent, base;
+    splitRemotePath(remotePath, parent, base);
+    return quoteCommand(parent, "MKD " + fromUtf8(base, opt_.encoding));
 #else
     return {FtpStatus::EngineUnavailable, "built without libcurl"};
 #endif
@@ -629,7 +1026,16 @@ FtpResult FtpSession::mkdir(const std::string& remotePath) {
 
 FtpResult FtpSession::removeFile(const std::string& remotePath) {
 #if defined(FTPFLOW_HAVE_CURL)
-    return quoteCommand("DELE " + remotePath);
+    std::string parent, base;
+    splitRemotePath(remotePath, parent, base);
+    // Prefer the relative form (CWD to parent + basename), which is the most
+    // widely accepted. If the server rejects it, retry with the absolute form
+    // (CWD to root + full path) -- some servers only accept one style.
+    FtpResult r = quoteCommand(parent, "DELE " + fromUtf8(base, opt_.encoding));
+    if (!r.ok() && r.curlCode == CURLE_QUOTE_ERROR) {
+        r = quoteCommand("/", "DELE " + fromUtf8(remotePath, opt_.encoding));
+    }
+    return r;
 #else
     return {FtpStatus::EngineUnavailable, "built without libcurl"};
 #endif
@@ -637,7 +1043,22 @@ FtpResult FtpSession::removeFile(const std::string& remotePath) {
 
 FtpResult FtpSession::removeDir(const std::string& remotePath) {
 #if defined(FTPFLOW_HAVE_CURL)
-    return quoteCommand("RMD " + remotePath);
+    std::string parent, base;
+    splitRemotePath(remotePath, parent, base);
+    // Prefer the relative form (CWD to parent + basename). If the server
+    // rejects it, retry with the absolute form (CWD to root + full path) --
+    // some servers only accept one style. An empty directory can also be
+    // refused when the basename lacks a trailing slash on a few strict
+    // servers, so try that spelling too before giving up.
+    FtpResult r = quoteCommand(parent, "RMD " + fromUtf8(base, opt_.encoding));
+    if (!r.ok() && r.curlCode == CURLE_QUOTE_ERROR) {
+        r = quoteCommand("/", "RMD " + fromUtf8(remotePath, opt_.encoding));
+    }
+    if (!r.ok() && r.curlCode == CURLE_QUOTE_ERROR) {
+        r = quoteCommand(parent,
+                         "RMD " + fromUtf8(base, opt_.encoding) + "/");
+    }
+    return r;
 #else
     return {FtpStatus::EngineUnavailable, "built without libcurl"};
 #endif
@@ -647,12 +1068,64 @@ FtpResult FtpSession::rename(const std::string& from, const std::string& to) {
 #if defined(FTPFLOW_HAVE_CURL)
     if (!impl_ || !impl_->easy) return {FtpStatus::IoError, "not open"};
     impl_->lastErr.clear();
-    // RNFR + RNTO must run as one sequence, so both commands share one
-    // QUOTE list (curl issues them in order and aborts on the first
-    // failure).
+
+    std::string fromParent, fromBase, toParent, toBase;
+    splitRemotePath(from, fromParent, fromBase);
+    splitRemotePath(to, toParent, toBase);
+
+    // IIS (and other strict servers) reject RNFR/RNTO with an absolute
+    // *virtual* path: they resolve the argument against their own CWD (the
+    // physical login root) and answer 550. When both sides live in the same
+    // directory we CWD there once and send relative basenames. A
+    // cross-directory rename goes out as two absolute paths, but they must
+    // be PHYSICAL (homeDir-prefixed on IIS user isolation) -- verified
+    // against a Microsoft FTP Service box: RNFR/RNTO with
+    // "/<home>/a/x.txt" -> "/<home>/b/x.txt" answers 350/250, while the
+    // virtual "/a/x.txt" form answers 550.
+    if (fromParent == toParent) {
+        // RNFR + RNTO must run as one sequence, so both commands share one
+        // QUOTE list (curl issues them in order and aborts on the first
+        // failure). As with quoteCommand(), libcurl sends QUOTE commands
+        // BEFORE its own CWD, so we CWD into the parent explicitly first --
+        // otherwise the relative basenames would run in the wrong directory
+        // and strict servers answer 550. The CWD target is the physical
+        // absolute path (homeDir-prefixed on IIS user isolation).
+        const std::string absFromParent = toServerAbsPath(fromParent);
+        struct curl_slist* quote = nullptr;
+        quote = ::curl_slist_append(
+            quote, ("CWD " + fromUtf8(absFromParent, opt_.encoding)).c_str());
+        quote = ::curl_slist_append(
+            quote, ("RNFR " + fromUtf8(fromBase, opt_.encoding)).c_str());
+        quote = ::curl_slist_append(
+            quote, ("RNTO " + fromUtf8(toBase, opt_.encoding)).c_str());
+        ::curl_easy_setopt(impl_->easy, CURLOPT_URL,
+                           makeUrl(opt_, "/", true).c_str());
+        ::curl_easy_setopt(impl_->easy, CURLOPT_QUOTE, quote);
+        ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 1L);
+        CURLcode rc = ::curl_easy_perform(impl_->easy);
+        ::curl_slist_free_all(quote);
+        ::curl_easy_setopt(impl_->easy, CURLOPT_QUOTE, nullptr);
+        ::curl_easy_setopt(impl_->easy, CURLOPT_NOBODY, 0L);
+        if (rc != CURLE_OK) {
+            impl_->lastCurlErr = (int)rc;
+            impl_->errBuf[sizeof(impl_->errBuf) - 1] = '\0';
+            impl_->lastErr = *impl_->errBuf ? impl_->errBuf
+                                            : ::curl_easy_strerror(rc);
+            impl_->lastErr = "rename: " + impl_->lastErr;
+            return {FtpStatus::IoError, impl_->lastErr, rc};
+        }
+        impl_->lastCurlErr = CURLE_OK;
+        return {};
+    }
+
+    // Cross-directory rename: two absolute PHYSICAL paths (see above).
+    const std::string absFrom = toServerAbsPath(from);
+    const std::string absTo = toServerAbsPath(to);
     struct curl_slist* quote = nullptr;
-    quote = ::curl_slist_append(quote, ("RNFR " + from).c_str());
-    quote = ::curl_slist_append(quote, ("RNTO " + to).c_str());
+    quote = ::curl_slist_append(
+        quote, ("RNFR " + fromUtf8(absFrom, opt_.encoding)).c_str());
+    quote = ::curl_slist_append(
+        quote, ("RNTO " + fromUtf8(absTo, opt_.encoding)).c_str());
     ::curl_easy_setopt(impl_->easy, CURLOPT_URL,
                        makeUrl(opt_, "/", true).c_str());
     ::curl_easy_setopt(impl_->easy, CURLOPT_QUOTE, quote);
@@ -712,11 +1185,16 @@ Capabilities FtpSession::capabilities() const {
 
 ListingPage FtpSession::list(const std::string&) { return {}; }
 
+ListingPage FtpSession::listAll(const std::string&) { return {}; }
+
 bool FtpSession::listViaMlsd(const std::string&, std::vector<Entry>&) {
     return false;
 }
 
 FtpResult FtpSession::size(const std::string&, std::uint64_t*) {
+    return {FtpStatus::EngineUnavailable, "built without libcurl"};
+}
+FtpResult FtpSession::stat(const std::string&, RemoteStat*) {
     return {FtpStatus::EngineUnavailable, "built without libcurl"};
 }
 
