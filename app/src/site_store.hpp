@@ -32,6 +32,8 @@ struct SiteEntry {
     QString keyPath;        // PEM private key file (path only)
     QString startDir;
     QString pushCmd;        // remote decompressor template (optional)
+    QString sftpCmd;        // custom SFTP startup command (optional, SFTP only)
+                            // e.g. "sudo su -c /usr/libexec/openssh/sftp-server"
     QString group;          // grouping label ("" = ungrouped), XTerminal-style
     QString encoding;       // filename encoding: "auto"/"utf-8"/"gbk" (FTP)
     QString note;           // free-form multiline remark shown in the UI

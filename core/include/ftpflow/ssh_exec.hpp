@@ -54,6 +54,15 @@ struct SshEndpoint {
     std::string password;               // password auth
     std::string privateKeyPem;          // or key auth (PEM/OpenSSH in memory)
     std::string privateKeyPassphrase;
+    // SFTP only. When non-empty, start the remote sftp-server with this
+    // command over an "exec" channel instead of requesting the standard
+    // "sftp" subsystem. Use this to elevate privileges on directories the
+    // login user cannot write, e.g.:
+    //   sudo su -c /usr/libexec/openssh/sftp-server
+    // Requires passwordless sudo (NOPASSWD) on the server, otherwise the
+    // command will block waiting for a TTY password prompt. Empty = default
+    // subsystem (backwards compatible).
+    std::string sftpCommand;
 };
 
 struct SshIoStats {

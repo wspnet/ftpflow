@@ -319,6 +319,15 @@ void ConnectDialog::buildUi() {
         "远端解压命令模板，{file}=目标路径；默认 \"zstd -d -c - -o {file}\"");
     form->addRow("解压命令:", pushCmd_);
 
+    sftpCmd_ = new QLineEdit(right);
+    sftpCmd_->setPlaceholderText(
+        "自定义 SFTP 启动命令（可选），如 sudo su -c /usr/libexec/openssh/sftp-server；"
+        "留空用默认 subsystem sftp。需服务器配置 sudo NOPASSWD");
+    sftpCmd_->setToolTip(
+        "某些目录登录用户无写权限时，可用提权命令启动 sftp-server。\n"
+        "留空 = 默认 subsystem sftp；服务器需允许该命令免密 sudo。");
+    form->addRow("SFTP启动命令:", sftpCmd_);
+
     group_ = new QLineEdit(right);
     group_->setPlaceholderText("分组名（如 \"生产\" / \"测试\"，可留空）");
     form->addRow("分组:", group_);
@@ -551,6 +560,7 @@ void ConnectDialog::onProtocolChanged(int index) {
     keyPath_->setEnabled(sftp);
     browseKeyBtn_->setEnabled(sftp);
     pushCmd_->setEnabled(sftp);
+    sftpCmd_->setEnabled(sftp);
     if (sftp && startDir_->text().isEmpty()) startDir_->setText(".");
     if (!sftp && startDir_->text() == ".") startDir_->setText("/");
 
@@ -723,6 +733,7 @@ void ConnectDialog::onSaveSite() {
     e.keyPath = keyPath_->text().trimmed();
     e.startDir = startDir_->text().trimmed();
     e.pushCmd = pushCmd_->text().trimmed();
+    e.sftpCmd = sftpCmd_->text().trimmed();
     e.group = group_->text().trimmed();
     e.encoding = encoding_->currentData().toString();
     e.note = note_->toPlainText().trimmed();
@@ -1022,6 +1033,7 @@ void ConnectDialog::loadSite(const SiteEntry& e) {
     keyPath_->setText(e.keyPath);
     startDir_->setText(e.startDir);
     pushCmd_->setText(e.pushCmd);
+    sftpCmd_->setText(e.sftpCmd);
     group_->setText(e.group);
     // Restore the saved filename encoding (default "auto").
     int encIdx = encoding_->findData(e.encoding.isEmpty() ? "auto" : e.encoding);
@@ -1048,6 +1060,7 @@ void ConnectDialog::resetFormForNewSite(const QString& group) {
     keyPath_->clear();
     startDir_->clear();
     pushCmd_->clear();
+    sftpCmd_->clear();
     // Default group: the current year-month as YYYYMM (e.g. 202611,
     // 202701) when no specific group is requested.
     if (group.isEmpty()) {
@@ -1119,6 +1132,8 @@ RemoteFsModel::ConnInfo ConnectDialog::connInfo() const {
     ci.ssh.port = ci.ftp.port;
     ci.ssh.user = ci.ftp.user;
     ci.ssh.password = ci.ftp.password;
+    ci.ssh.sftpCommand = ci.isSftp
+        ? sftpCmd_->text().trimmed().toStdString() : std::string();
     if (!keyPath_->text().trimmed().isEmpty()) {
         ci.ssh.privateKeyPem =
             readWholeFileStr(keyPath_->text().trimmed());

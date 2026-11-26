@@ -149,6 +149,10 @@ def main() -> int:
         env["VCPKG_ROOT"] = str(vcpkg_root)
         env["VCPKG_DEFAULT_TRIPLET"] = "x64-windows-static-ftpflow"
         env["VCPKG_OVERLAY_TRIPLETS"] = str(ROOT / "triplets")
+        # ftpflow overlay ports: libssh2 is patched to allow a custom SFTP
+        # startup command (elevated sftp-server via sudo). Must match the
+        # VCPKG_OVERLAY_PORTS cache variable in CMakePresets.json.
+        env["VCPKG_OVERLAY_PORTS"] = str(ROOT / "ports")
         # jom's parallel child coordination deadlocks on this machine
         # (cl.exe spawns, runs ~16ms, then blocks forever; three observed
         # freezes mid openssl build). vcpkg_build_nmake skips jom entirely

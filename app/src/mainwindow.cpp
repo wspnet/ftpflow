@@ -590,6 +590,8 @@ void MainWindow::restoreJournal() {
                 r.ssh.port = (std::uint16_t)e.port;
                 r.ssh.user = e.user.toStdString();
                 r.ssh.password = full.password.toStdString();
+                r.ssh.sftpCommand = e.isSftp ? e.sftpCmd.toStdString()
+                                             : std::string();
                 if (!e.keyPath.isEmpty())
                     r.ssh.privateKeyPem = readKeyFile(e.keyPath);
                 r.ftp.host = r.ssh.host;
@@ -3575,6 +3577,7 @@ static QString serializeSitesForSync(const ftpflow::SiteStore& store) {
         if (!e.keyPath.isEmpty()) o.insert("keyPath", e.keyPath);
         if (!e.startDir.isEmpty()) o.insert("startDir", e.startDir);
         if (!e.pushCmd.isEmpty()) o.insert("pushCmd", e.pushCmd);
+        if (!e.sftpCmd.isEmpty()) o.insert("sftpCmd", e.sftpCmd);
         if (!e.group.isEmpty()) o.insert("group", e.group);
         if (!e.encoding.isEmpty() && e.encoding != "auto")
             o.insert("encoding", e.encoding);
@@ -3644,6 +3647,7 @@ static int mergeDownloadedSites(ftpflow::SiteStore& store,
         e.keyPath = o.value("keyPath").toString();
         e.startDir = o.value("startDir").toString();
         e.pushCmd = o.value("pushCmd").toString();
+        e.sftpCmd = o.value("sftpCmd").toString();
         e.group = o.value("group").toString();
         e.encoding = o.value("encoding").toString("auto");
         e.note = o.value("note").toString();

@@ -86,6 +86,7 @@ private:
     QLineEdit* keyPath_ = nullptr;
     QLineEdit* startDir_ = nullptr;
     QLineEdit* pushCmd_ = nullptr;
+    QLineEdit* sftpCmd_ = nullptr;
     QLineEdit* group_ = nullptr;
     QComboBox* encoding_ = nullptr;
     QPushButton* browseKeyBtn_ = nullptr;

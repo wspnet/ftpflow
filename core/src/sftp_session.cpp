@@ -222,13 +222,42 @@ SftpResult SftpSession::open(const SshEndpoint& ep,
         return r;
     }
 
-    // Start the SFTP subsystem.
+    // Start the SFTP service. By default libssh2 requests the "sftp"
+    // subsystem. When the site supplies a custom startup command (e.g.
+    // `sudo su -c /usr/libexec/openssh/sftp-server` for directories the
+    // login user cannot write), borrow that string into libssh2 so it runs
+    // the command on an exec channel instead. The pointer stays valid for
+    // the whole EAGAIN loop (ep is a const ref to the caller's endpoint).
+    const char* startup = ep.sftpCommand.empty() ? nullptr
+                                                 : ep.sftpCommand.c_str();
+    libssh2_sftp_set_startup_command(impl_->session, startup);
+    // Bound the handshake. With a bad custom startup command the remote end
+    // never speaks SFTP, so libssh2_sftp_init() keeps returning EAGAIN on a
+    // channel that will never deliver data -- without a deadline the UI
+    // would hang forever. A healthy sftp-server replies in milliseconds;
+    // 30s is ample even over a slow link.
+    const auto initDeadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(30);
+    bool initTimedOut = false;
     while ((impl_->sftp = libssh2_sftp_init(impl_->session)) == nullptr &&
            libssh2_session_last_errno(impl_->session) == LIBSSH2_ERROR_EAGAIN) {
+        if (std::chrono::steady_clock::now() >= initDeadline) {
+            initTimedOut = true;
+            break;
+        }
         waitSocket(impl_->sock, false, 5000);
     }
+    libssh2_sftp_set_startup_command(impl_->session, nullptr);  // clear borrowed ptr
     if (!impl_->sftp) {
-        SftpResult r = mapSshErr(SftpStatus::SftpFailed, "sftp_init", impl_->session);
+        SftpResult r;
+        if (initTimedOut) {
+            r.status = SftpStatus::SftpFailed;
+            r.message = startup
+                ? "SFTP startup command produced no response (check --sftp-cmd)"
+                : "SFTP handshake timed out";
+        } else {
+            r = mapSshErr(SftpStatus::SftpFailed, "sftp_init", impl_->session);
+        }
         close();
         return r;
     }

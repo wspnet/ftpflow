@@ -159,6 +159,49 @@ int main() {
         CHECK(!smartShouldSkip(src, dir));
     }
 
+    // ---- Part A0b: custom SFTP startup command forces the Store pipeline -
+    // A configured sftpCommand (e.g. `sudo su -c .../sftp-server`) only
+    // applies to the SFTP channel, NOT the raw SSH exec compression pipe.
+    // Even with autoDecide on a highly compressible file (which would
+    // normally verdict Compress), the queue must force Store so elevated
+    // writes actually happen. Started fires before connecting, so an
+    // unroutable endpoint is enough to observe the chosen mode offline.
+    {
+        const std::string src = exeDir() + "/tq_sftp_cmd_src.bin";
+        makeFiller(src, 256 * 1024);   // highly compressible filler
+
+        ftpflow::TransferQueue q(1, 50);
+        std::atomic<int> startedMode{-1};
+        q.setEventCallback([&startedMode](const ftpflow::TransferEvent& e) {
+            if (e.kind == ftpflow::TransferEvent::Kind::Started)
+                startedMode.store((int)e.mode);
+        });
+
+        ftpflow::TransferRequest req;
+        req.protocol = ftpflow::BackendKind::Sftp;
+        req.direction = ftpflow::TransferDirection::Upload;
+        req.localPath = src;
+        req.remotePath = "/tq_sftp_cmd_dst.bin";
+        req.autoDecide = true;                       // would pick Compress
+        req.ssh.host = "127.0.0.1";
+        req.ssh.port = 1;                            // nothing listens
+        req.ssh.user = "alice";
+        req.ssh.password = "x";
+        req.ssh.sftpCommand = "sudo su -c /usr/libexec/openssh/sftp-server";
+
+        const std::uint64_t id = q.enqueue(req);
+        CHECK(id != 0);
+        q.waitAll();
+        CHECK(startedMode.load() == (int)ftpflow::TransferMode::Store);
+
+        // Field is a plain value copy -- survives being carried in the
+        // request (and thus in a root template for SFTP jobs).
+        ftpflow::SshEndpoint copy = req.ssh;
+        CHECK(copy.sftpCommand == req.ssh.sftpCommand);
+
+        std::remove(src.c_str());
+    }
+
     // ---- Part A: offline dispatch/cancel/waitAll semantics --------------
     {
         ftpflow::TransferQueue q(1, 50);

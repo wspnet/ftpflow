@@ -765,7 +765,15 @@ void TransferQueue::runJob(Job* job) {
         mode = TransferMode::Ftz1;
     } else if (req.protocol == BackendKind::Sftp &&
                req.direction == TransferDirection::Upload) {
-        if (req.autoDecide) {
+        // A custom SFTP startup command (e.g. sudo ... sftp-server) only
+        // applies to the SFTP subsystem/exec-started sftp-server channel,
+        // NOT the raw SSH exec compression pipeline. To make elevated
+        // writes actually work, force the SFTP Store path when a startup
+        // command is configured -- otherwise an auto-Decide "Compress"
+        // verdict would upload through an unprivileged exec channel.
+        if (!req.ssh.sftpCommand.empty()) {
+            mode = TransferMode::Store;
+        } else if (req.autoDecide) {
             const FileProbe probe = probeLocalFile(req.localPath);
             decision = decideFullFunnel(probe, req.costModel);
             mode = decision.verdict == Verdict::Compress

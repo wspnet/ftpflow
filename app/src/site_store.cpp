@@ -44,6 +44,7 @@ SiteEntry fromJson(const QJsonObject& o) {
     e.keyPath = o.value("keyPath").toString();
     e.startDir = o.value("startDir").toString();
     e.pushCmd = o.value("pushCmd").toString();
+    e.sftpCmd = o.value("sftpCmd").toString();
     e.group = o.value("group").toString();
     e.encoding = o.value("encoding").toString("auto");
     e.note = o.value("note").toString();
@@ -60,6 +61,7 @@ QJsonObject toJson(const SiteEntry& e) {
     if (!e.keyPath.isEmpty()) o.insert("keyPath", e.keyPath);
     if (!e.startDir.isEmpty()) o.insert("startDir", e.startDir);
     if (!e.pushCmd.isEmpty()) o.insert("pushCmd", e.pushCmd);
+    if (!e.sftpCmd.isEmpty()) o.insert("sftpCmd", e.sftpCmd);
     if (!e.group.isEmpty()) o.insert("group", e.group);
     if (!e.encoding.isEmpty() && e.encoding != "auto")
         o.insert("encoding", e.encoding);

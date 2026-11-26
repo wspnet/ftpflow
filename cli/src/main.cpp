@@ -579,7 +579,9 @@ int cmdSftp(const std::vector<std::string>& a) {
             "usage: ftpcli sftp <cmd> <host[:port]> <user> <password|-> [--key <path>] ...\n"
             "  ls <dir> | size <r> | get <r> <l> | put <l> <r>\n"
             "  mkdir <dir> | rmdir <dir> | rm <file> | chmod <path> <mode>\n"
-            "  password '-' + --key <path> selects private-key auth.\n");
+            "  password '-' + --key <path> selects private-key auth.\n"
+            "  --sftp-cmd <command>  run a custom sftp-server startup command\n"
+            "                        (e.g. sudo su -c /usr/libexec/openssh/sftp-server)\n");
         return 2;
     }
     const std::string& cmd = a[0];
@@ -600,6 +602,8 @@ int cmdSftp(const std::vector<std::string>& a) {
                 std::fprintf(stderr, "sftp: cannot read key file %s\n", a[i].c_str());
                 return 2;
             }
+        } else if (a[i] == "--sftp-cmd" && i + 1 < a.size()) {
+            ep.sftpCommand = a[++i];
         } else {
             rest.push_back(a[i]);
         }
@@ -760,7 +764,7 @@ int cmdQueue(const std::vector<std::string>& a) {
             "usage: ftpcli queue <ftp|sftp|ssh> <host[:port]> <user> <pw|-> [--key K]\n"
             "                     [--workers N] [--level N] [--cmd T] [--store]\n"
             "                     [--resume] [--ftz] [--down] [-r]\n"
-            "                     [--journal PATH] [--restore]\n"
+            "                     [--sftp-cmd CMD] [--journal PATH] [--restore]\n"
             "                     <local> <remote> [...]\n"
             "  --resume:  continue from the already-transferred prefix.\n"
             "  --ftz:     FTZ1 container mode (ssh/sftp endpoints only).\n"
@@ -809,6 +813,8 @@ int cmdQueue(const std::vector<std::string>& a) {
             level = std::atoi(a[++i].c_str());
         } else if (a[i] == "--cmd" && i + 1 < a.size()) {
             cmdTemplate = a[++i];
+        } else if (a[i] == "--sftp-cmd" && i + 1 < a.size()) {
+            ep.sftpCommand = a[++i];
         } else if (a[i] == "--store") {
             store = true;
         } else if (a[i] == "--resume") {

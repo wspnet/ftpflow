@@ -1,0 +1,75 @@
+--- a/include/libssh2_sftp.h
++++ b/include/libssh2_sftp.h
+@@ -221,6 +221,15 @@
+ 
+ /* SFTP API */
+ LIBSSH2_API LIBSSH2_SFTP *libssh2_sftp_init(LIBSSH2_SESSION *session);
++/* ftpflow extension: override how the SFTP service is started on the SSH
++ * channel. By default libssh2 requests the "sftp" subsystem. Callers that
++ * need elevated privileges on the server (e.g. `sudo su -c /usr/libexec/
++ * openssh/sftp-server`) can instead run an arbitrary command via an "exec"
++ * channel request. The pointers are borrowed for the duration of the
++ * libssh2_sftp_init() call and need only stay valid until it returns.
++ * Pass NULL for `command` to restore the default subsystem behaviour. */
++LIBSSH2_API void libssh2_sftp_set_startup_command(LIBSSH2_SESSION *session,
++                                                  const char *command);
+ LIBSSH2_API int libssh2_sftp_shutdown(LIBSSH2_SFTP *sftp);
+ LIBSSH2_API unsigned long libssh2_sftp_last_error(LIBSSH2_SFTP *sftp);
+ LIBSSH2_API LIBSSH2_CHANNEL *libssh2_sftp_get_channel(LIBSSH2_SFTP *sftp);
+--- a/src/libssh2_priv.h
++++ b/src/libssh2_priv.h
+@@ -919,6 +919,10 @@
+                                            + version_id(4) */
+     size_t sftpInit_sent; /* number of bytes from the buffer that have been
+                              sent */
++    /* ftpflow extension: borrowed command string for starting the SFTP
++       service via an "exec" channel request instead of the "sftp" subsystem.
++       NULL => default subsystem. Valid only during libssh2_sftp_init(). */
++    const char *sftpStartupCommand;
+ 
+     /* State variables used in libssh2_scp_recv2() */
+     libssh2_nonblocking_states scpRecv_state;
+--- a/src/sftp.c
++++ b/src/sftp.c
+@@ -830,11 +830,24 @@
+     }
+ 
+     if(session->sftpInit_state == libssh2_NB_state_sent) {
+-        int ret = _libssh2_channel_process_startup(session->sftpInit_channel,
++        int ret;
++        if(session->sftpStartupCommand) {
++            /* ftpflow: run a custom command (e.g. sudo ... sftp-server) on
++               an exec channel instead of requesting the sftp subsystem. */
++            const char *cmd = session->sftpStartupCommand;
++            ret = _libssh2_channel_process_startup(session->sftpInit_channel,
++                                                   "exec",
++                                                   sizeof("exec") - 1,
++                                                   cmd,
++                                                   strlen(cmd));
++        }
++        else {
++            ret = _libssh2_channel_process_startup(session->sftpInit_channel,
+                                                    "subsystem",
+                                                    sizeof("subsystem") - 1,
+                                                    "sftp",
+                                                    strlen("sftp"));
++        }
+         if(ret == LIBSSH2_ERROR_EAGAIN) {
+             _libssh2_error(session, LIBSSH2_ERROR_EAGAIN,
+                            "Would block to request SFTP subsystem");
+@@ -1026,6 +1039,15 @@
+ sftp_init_error:
+     session->sftpInit_state = libssh2_NB_state_error_closing;
+     return NULL;
++}
++
++/* ftpflow extension: set a borrowed startup command (see header). */
++LIBSSH2_API void
++libssh2_sftp_set_startup_command(LIBSSH2_SESSION *session,
++                                 const char *command)
++{
++    if(session)
++        session->sftpStartupCommand = command;
+ }
+ 
+ /* libssh2_sftp_init
