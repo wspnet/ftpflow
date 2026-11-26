@@ -59,6 +59,15 @@ target_link_libraries(test_inline_rename PRIVATE
     ftpflow_core Qt6::Core Qt6::Gui Qt6::Concurrent)
 target_compile_features(test_inline_rename PRIVATE cxx_std_17)
 
+# Sorting proxy: '..' pinned on top + folders grouped above files on every
+# column/direction, and the 文件类型 column text. Console Qt Core + Gui.
+qt_add_executable(test_entry_sort tests/test_entry_sort.cpp
+    src/local_fs_model.cpp src/file_icon.cpp)
+target_include_directories(test_entry_sort PRIVATE src)
+target_link_libraries(test_entry_sort PRIVATE
+    ftpflow_core Qt6::Core Qt6::Gui Qt6::Concurrent)
+target_compile_features(test_entry_sort PRIVATE cxx_std_17)
+
 # VT charset-designation regression: ESC ( B must not swallow following text.
 add_executable(test_vt_charset tests/test_vt_charset.cpp src/vt_parser.cpp src/terminal_buffer.cpp)
 set_target_properties(test_vt_charset PROPERTIES AUTOMOC OFF)

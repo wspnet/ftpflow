@@ -26,6 +26,7 @@ public:
     enum Column {
         ColName = 0,
         ColSize,
+        ColType,
         ColModified,
         ColVerdict,
         ColCount,

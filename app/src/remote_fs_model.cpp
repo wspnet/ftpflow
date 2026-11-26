@@ -454,6 +454,11 @@ QVariant RemoteFsModel::data(const QModelIndex& idx, int role) const {
         return int(Qt::AlignRight | Qt::AlignVCenter);
     if (role == Qt::DecorationRole && idx.column() == ColName)
         return fileIcon(e);
+    // Fixed group key for EntrySortProxyModel: ".." pinned first, folders
+    // above files, regardless of the active column or sort direction.
+    if (role == kEntryKindRole)
+        return isParentRow(idx) ? 0
+             : (e.type == EntryType::Directory ? 1 : 2);
     // Rows with a delete in flight: dimmed + italic (see removeEntries).
     if (!pendingRemove_.empty()) {
         if (pendingRemove_.count(pathAt(idx))) {
@@ -477,6 +482,8 @@ QVariant RemoteFsModel::data(const QModelIndex& idx, int role) const {
                     ? QVariant::fromValue<qlonglong>(-1)
                     : QVariant::fromValue<qlonglong>(
                           static_cast<qlonglong>(e.size));
+            case ColType:
+                return fileTypeText(e);
             case ColModified:
                 // Folders sort by their own mtime too (not a hardcoded -1),
                 // so time sorting is meaningful across files and directories.
@@ -500,6 +507,8 @@ QVariant RemoteFsModel::data(const QModelIndex& idx, int role) const {
         case ColSize:
             return e.type == EntryType::Directory
                 ? QString("<dir>") : humanSize(e.size);
+        case ColType:
+            return fileTypeText(e);
         case ColModified:
             return e.mtimeUnix == 0
                 ? QString("-")
@@ -515,6 +524,7 @@ QVariant RemoteFsModel::headerData(int section, Qt::Orientation o,
     switch (section) {
         case ColName: return "名称";
         case ColSize: return "大小";
+        case ColType: return "文件类型";
         case ColModified: return "修改时间";
     }
     return {};

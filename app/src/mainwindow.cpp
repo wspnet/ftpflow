@@ -713,9 +713,8 @@ void MainWindow::buildUi() {
         showRoot(pathEdit_->text().toStdString());
     });
     model_ = new LocalFsModel(this);
-    proxy_ = new QSortFilterProxyModel(this);
+    proxy_ = new EntrySortProxyModel(this);
     proxy_->setSourceModel(model_);
-    proxy_->setSortRole(kDirFirstSortRole);
     left_ = new QTableView(leftPane);
     left_->setModel(proxy_);
     left_->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
@@ -733,9 +732,11 @@ void MainWindow::buildUi() {
     left_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     left_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
     left_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
+    left_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
     left_->setColumnWidth(1, 90);
-    left_->setColumnWidth(2, 150);
-    // 隐藏"压缩判定"列（本地列表只展示名称/大小/修改时间）
+    left_->setColumnWidth(2, 160);   // 文件类型
+    left_->setColumnWidth(3, 150);   // 修改时间
+    // 隐藏"压缩判定"列（本地列表只展示名称/大小/类型/修改时间）
     left_->hideColumn(LocalFsModel::ColVerdict);
     left_->verticalHeader()->hide();
     left_->horizontalHeader()->setSortIndicator(0, Qt::AscendingOrder);
@@ -1138,9 +1139,8 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
     // Model/proxy are children of MainWindow (not the page) so they survive
     // independently; onTabClosed() deletes them explicitly.
     tab->model = new RemoteFsModel(this);
-    tab->proxy = new QSortFilterProxyModel(this);
+    tab->proxy = new EntrySortProxyModel(this);
     tab->proxy->setSourceModel(tab->model);
-    tab->proxy->setSortRole(kDirFirstSortRole);
     tab->table = new QTableView(page);
     tab->table->setModel(tab->proxy);
     tab->table->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
@@ -1158,8 +1158,10 @@ MainWindow::RemoteTab* MainWindow::addRemoteTab() {
     // of letting the name column swallow the whole width.
     tab->table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
     tab->table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
+    tab->table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
     tab->table->setColumnWidth(1, 90);
-    tab->table->setColumnWidth(2, 150);
+    tab->table->setColumnWidth(2, 160);   // 文件类型
+    tab->table->setColumnWidth(3, 150);   // 修改时间
     tab->table->verticalHeader()->hide();
     tab->table->horizontalHeader()->setSortIndicator(0, Qt::AscendingOrder);
     pageLay->addWidget(remoteBar);

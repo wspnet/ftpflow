@@ -17,6 +17,7 @@
 #include <QVector>
 
 #include "ftpflow/transfer_queue.hpp"
+#include "entry_sort_proxy.hpp"
 #include "local_fs_model.hpp"
 #include "remote_fs_model.hpp"
 #include "site_store.hpp"
@@ -138,7 +139,7 @@ private:
     struct RemoteTab {
         QWidget* page = nullptr;   // the tab's page widget (identity anchor)
         RemoteFsModel* model = nullptr;
-        QSortFilterProxyModel* proxy = nullptr;
+        EntrySortProxyModel* proxy = nullptr;
         QTableView* table = nullptr;
         QLineEdit* pathEdit = nullptr;
         QPushButton* connectBtn = nullptr;
@@ -229,7 +230,7 @@ private:
     bool askFolderArchive(const QString& folderPath);
 
     LocalFsModel* model_ = nullptr;
-    QSortFilterProxyModel* proxy_ = nullptr;
+    EntrySortProxyModel* proxy_ = nullptr;
     QTableView* left_ = nullptr;
     QLineEdit* pathEdit_ = nullptr;
 
